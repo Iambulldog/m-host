@@ -30,11 +30,13 @@ struct ProxyVHost: Identifiable, Codable, Equatable {
     /// - .folder:  absolute path เช่น "/Users/me/projects/myapp/public"
     var target: String
     var enabled: Bool = true
+    /// เส้นทาง cert และ key (ถ้ามี)
+    var certPath: String?
+    var keyPath: String?
 
     func matches(host candidate: String) -> Bool {
         let a = host.lowercased().trimmingCharacters(in: .whitespaces)
         let b = candidate.lowercased().trimmingCharacters(in: .whitespaces)
-        // strip port ถ้ามี
         let bare = { (s: String) -> String in
             if let i = s.firstIndex(of: ":") { return String(s[..<i]) }
             return s

@@ -487,7 +487,9 @@ final class ProxyServer {
 
     private func startMitm(clientConn: NWConnection, host: String, vhost: ProxyVHost) {
         do {
+            log("[MITM] Ensuring TLS sub-listener for host=\(host)...")
             let port = try ensureTLSSubListener(for: host)
+            log("[MITM] Sub-listener for host=\(host) is on port \(port)")
             let upstream = NWConnection(
                 host: NWEndpoint.Host("127.0.0.1"),
                 port: NWEndpoint.Port(integerLiteral: port),
@@ -496,6 +498,7 @@ final class ProxyServer {
             upstream.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
+                    self?.log("[MITM] Upstream connection ready for host=\(host) port=\(port)")
                     self?.pipe(from: clientConn, to: upstream)
                     self?.pipe(from: upstream, to: clientConn)
                 case .failed(let err):
@@ -507,16 +510,35 @@ final class ProxyServer {
             upstream.start(queue: queue)
         } catch {
             log("✗ MITM error \(host): \(error.localizedDescription)")
+            // เพิ่ม log รายละเอียด certPath, keyPath, mkcertPathSnapshot, vhost, vhost.kind, vhost.target
+            log("[DEBUG] vhost: host=\(vhost.host) kind=\(vhost.kind.rawValue) target=\(vhost.target) certPath=\(vhost.certPath ?? "nil") keyPath=\(vhost.keyPath ?? "nil") mkcertPath=\(mkcertPathSnapshot ?? "nil")")
             clientConn.cancel()
         }
     }
 
     /// สร้าง (หรือดึง) NWListener TLS สำหรับ host พร้อม cert mkcert — คืน port
     private func ensureTLSSubListener(for host: String) throws -> UInt16 {
-        if let entry = tlsListeners[host] { return entry.port }
+        if let entry = tlsListeners[host] {
+            log("[MITM] Reusing existing TLS sub-listener for host=\(host) on port \(entry.port)")
+            return entry.port
+        }
 
-        let identity = try certs.identity(for: host, mkcertPath: mkcertPathSnapshot)
+        // ดึง vhost เพื่อดู certPath/keyPath
+        let vhostCopy = vhostsSnapshot().first(where: { $0.matches(host: host) })
+        let certPath = vhostCopy?.certPath
+        let keyPath = vhostCopy?.keyPath
+
+        let identity: SecIdentity
+        do {
+            log("[MITM] Loading identity for host=\(host) certPath=\(certPath ?? "nil") keyPath=\(keyPath ?? "nil") mkcertPath=\(mkcertPathSnapshot ?? "nil")")
+            identity = try certs.identity(for: host, mkcertPath: mkcertPathSnapshot, certPath: certPath, keyPath: keyPath)
+            log("[MITM] Loaded identity for host=\(host)")
+        } catch {
+            log("✗ certs.identity failed for host=\(host) certPath=\(certPath ?? "nil") keyPath=\(keyPath ?? "nil"): \(error.localizedDescription)")
+            throw error
+        }
         guard let secIdentity = sec_identity_create(identity) else {
+            log("✗ sec_identity_create failed for host=\(host) certPath=\(certPath ?? "nil") keyPath=\(keyPath ?? "nil")")
             throw ProxyCertManager.CertError.identityMissing
         }
 
@@ -527,46 +549,90 @@ final class ProxyServer {
         params.allowLocalEndpointReuse = true
 
         let l = try NWListener(using: params, on: .any)
-        // capture vhost snapshot
-        let vhostCopy = vhostsSnapshot().first(where: { $0.matches(host: host) })
 
         l.newConnectionHandler = { [weak self] conn in
             guard let self else { conn.cancel(); return }
+            self.log("[MITM] TLS sub-listener accepted connection for host=\(host)")
             conn.start(queue: self.queue)
             self.readHttpHead(conn: conn, accumulated: Data()) { head, leftover in
                 guard let s = String(data: head, encoding: .utf8),
                       let firstLine = s.components(separatedBy: "\r\n").first else {
+                    self.log("[MITM] Malformed HTTP head from client on TLS sub-listener for host=\(host)")
                     conn.cancel(); return
                 }
                 let parts = firstLine.split(separator: " ", maxSplits: 2).map(String.init)
-                guard parts.count >= 2 else { conn.cancel(); return }
+                guard parts.count >= 2 else {
+                    self.log("[MITM] Malformed HTTP request line from client on TLS sub-listener for host=\(host)")
+                    conn.cancel(); return
+                }
                 let target = parts[1]
                 guard let v = vhostCopy else {
+                    self.log("[MITM] vhostCopy missing for host=\(host)")
                     self.sendSimple(conn: conn, status: 502, body: "vhost gone")
                     return
                 }
+                self.log("[MITM] Handling request for host=\(host) target=\(target) kind=\(v.kind.rawValue)")
                 switch v.kind {
                 case .forward:
+                    self.log("[MITM] Forwarding HTTPS request for host=\(host) to URL=\(v.target)")
                     self.forwardHttpToURL(clientConn: conn, originalHead: s, leftover: leftover,
                                           originalTarget: target, forwardURL: v.target,
                                           originalHost: host)
                 case .folder:
+                    self.log("[MITM] Serving static folder for host=\(host) path=\(v.target)")
                     self.serveStatic(clientConn: conn, target: target, folder: v.target)
                 }
             }
         }
+
+        let readySemaphore = DispatchSemaphore(value: 0)
+        var listenerError: Error? = nil
+        l.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.log("[MITM] TLS sub-listener state: ready for host=\(host) port=\(l.port?.rawValue ?? 0)")
+                readySemaphore.signal()
+            case .failed(let err):
+                self?.log("[MITM] TLS sub-listener state: failed for host=\(host): \(err.localizedDescription)")
+                listenerError = err
+                readySemaphore.signal()
+            case .cancelled:
+                self?.log("[MITM] TLS sub-listener state: cancelled for host=\(host)")
+                readySemaphore.signal()
+            default:
+                self?.log("[MITM] TLS sub-listener state: \(state) for host=\(host)")
+            }
+        }
         l.start(queue: queue)
 
-        // poll port (NWListener อาจ assign port หลัง start)
-        let deadline = Date().addingTimeInterval(2.0)
-        while l.port == nil, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
+        // Wait for listener to be ready or failed
+        let timeout: DispatchTime = .now() + 2.0
+        _ = readySemaphore.wait(timeout: timeout)
+        if let err = listenerError {
+            l.cancel()
+            throw err
         }
-        guard let p = l.port else {
+        guard let p = l.port, p.rawValue != 0 else {
+            log("[MITM] TLS sub-listener failed to get port for host=\(host)")
             l.cancel()
             throw ProxyCertManager.CertError.identityMissing
         }
         let portValue: UInt16 = p.rawValue
+        log("[MITM] TLS sub-listener for host=\(host) assigned port \(portValue)")
+
+        l.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.log("[MITM] TLS sub-listener state: ready for host=\(host) port=\(l.port?.rawValue ?? 0)")
+            case .failed(let err):
+                self?.log("[MITM] TLS sub-listener state: failed for host=\(host): \(err.localizedDescription)")
+            case .cancelled:
+                self?.log("[MITM] TLS sub-listener state: cancelled for host=\(host)")
+            default:
+                self?.log("[MITM] TLS sub-listener state: \(state) for host=\(host)")
+            }
+        }
+
         tlsListeners[host] = (l, portValue)
         return portValue
     }

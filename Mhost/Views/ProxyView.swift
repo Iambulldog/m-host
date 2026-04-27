@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ProxyView: View {
     @State private var server = ProxyServer()
@@ -236,51 +237,105 @@ struct ProxyView: View {
     }
 }
 
-private struct ProxyLogSheet: View {
+struct ProxyLogSheet: View {
     let lines: [String]
     @Binding var isPresented: Bool
+    @State private var filterText: String = ""
+    @State private var copied: Bool = false
+
+    var filteredLines: [String] {
+        if filterText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return lines
+        } else {
+            return lines.filter { $0.localizedCaseInsensitiveContains(filterText) }
+        }
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Proxy log").font(.headline)
-                Text("(\(lines.count) lines)")
+        NavigationView {
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    TextField("Filter log...", text: $filterText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 8)
+                        .background(Color(NSColor.controlBackgroundColor).opacity(0.8))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.accentColor.opacity(0.4), lineWidth: 1)
+                        )
+                        .frame(minWidth: 120)
+                    Spacer()
+                    Button(action: {
+                        let pasteboard = NSPasteboard.general
+                        pasteboard.clearContents()
+                        pasteboard.setString(filteredLines.joined(separator: "\n"), forType: .string)
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                    }) {
+                        Label(copied ? "Copied!" : "Copy All", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(lines.joined(separator: "\n"), forType: .string)
-                } label: { Image(systemName: "doc.on.doc") }
-                    .help("คัดลอก log ทั้งหมด")
-                Button("Close") { isPresented = false }
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding()
-            Divider()
-            // เลื่อนได้ทั้งแนวตั้ง + แนวนอน — แต่ละบรรทัดไม่ wrap
-            ScrollView([.vertical, .horizontal]) {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    if lines.isEmpty {
-                        Text("(no log)")
-                            .foregroundStyle(.secondary)
-                            .padding()
-                    } else {
-                        ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                            Text(line)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
+                }
+                .padding([.horizontal, .top], 12)
+                Divider()
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical, showsIndicators: true) {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(filteredLines.indices, id: \.self) { idx in
+                                let line = filteredLines[idx]
+                                Text(line)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .lineLimit(nil)
+                                    .foregroundColor(
+                                        line.localizedCaseInsensitiveContains("error") ? .red :
+                                        (line.localizedCaseInsensitiveContains("warn") ? .orange : .primary)
+                                    )
+                                    .padding(.vertical, 1.5)
+                                    .padding(.horizontal, 6)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .fill(line.localizedCaseInsensitiveContains("error") ? Color.red.opacity(0.08) : Color.clear)
+                                    )
+                                    .id(idx)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 8)
+                    }
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color(.windowBackgroundColor).opacity(0.95))
+                            .shadow(color: Color.black.opacity(0.08), radius: 8, x: 0, y: 2)
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onChange(of: filteredLines.count) { _, _ in
+                        if let last = filteredLines.indices.last {
+                            withAnimation { proxy.scrollTo(last, anchor: .bottom) }
+                        }
+                    }
+                    .onAppear {
+                        if let last = filteredLines.indices.last {
+                            proxy.scrollTo(last, anchor: .bottom)
                         }
                     }
                 }
-                .padding()
             }
-            .background(Color.black.opacity(0.05))
+            .frame(minWidth: 400, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
+            .background(Color(.windowBackgroundColor).opacity(0.98))
+            .cornerRadius(16)
+            .padding(8)
+            .navigationTitle("Proxy Log")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { isPresented = false }
+                }
+            }
         }
-        .frame(minWidth: 700, idealWidth: 1000, minHeight: 400, idealHeight: 600)
+        .frame(minWidth: 400, minHeight: 300)
     }
 }
 
@@ -329,27 +384,31 @@ private struct VHostRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
+            HStack(spacing: 12) {
                 Toggle("", isOn: $v.enabled)
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .help("เปิด/ปิดกฎนี้")
 
-                TextField("", text: $v.host, prompt: Text("myapp.local"))
+                TextField("Host", text: $v.host, prompt: Text("myapp.local"))
                     .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 120, maxWidth: 180)
+                    .layoutPriority(2)
 
-                Picker("", selection: $v.kind) {
+                Picker("Type", selection: $v.kind) {
                     ForEach(ProxyVHostTargetKind.allCases) { k in
                         Text(k.label).tag(k)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 140)
+                .frame(width: 130)
+                .layoutPriority(1)
 
                 Button(role: .destructive) {
                     onDelete()
                 } label: {
                     Image(systemName: "trash")
+                        .foregroundColor(.red)
                 }
                 .buttonStyle(.borderless)
                 .help("ลบ vhost นี้")
@@ -358,27 +417,72 @@ private struct VHostRow: View {
                 switch v.kind {
                 case .forward:
                     TextField(
-                        "",
+                        "Target URL",
                         text: $v.target,
                         prompt: Text("http://127.0.0.1:3000")
                     )
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
+                    .frame(minWidth: 220)
                 case .folder:
                     TextField(
-                        "",
+                        "Folder Path",
                         text: $v.target,
                         prompt: Text("/Users/me/project/public")
                     )
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
+                    .frame(minWidth: 220)
                     Button("Browse...") {
                         if let p = onPickFolder() { v.target = p }
                     }
                 }
             }
+            // เพิ่มส่วนเลือก certPath และ keyPath
+            HStack(spacing: 8) {
+                TextField("Certificate Path (.crt/.pem)", text: Binding(
+                    get: { v.certPath ?? "" },
+                    set: { v.certPath = $0.isEmpty ? nil : $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.caption, design: .monospaced))
+                .frame(minWidth: 180)
+                Button("Browse Cert...") {
+                    if let path = openFilePanel(allowedTypes: ["crt", "pem"]) {
+                        v.certPath = path
+                    }
+                }
+                TextField("Key Path (.key)", text: Binding(
+                    get: { v.keyPath ?? "" },
+                    set: { v.keyPath = $0.isEmpty ? nil : $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.caption, design: .monospaced))
+                .frame(minWidth: 180)
+                Button("Browse Key...") {
+                    if let path = openFilePanel(allowedTypes: ["key", "pem"]) {
+                        v.keyPath = path
+                    }
+                }
+            }
         }
         .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.black.opacity(0.05))
+        .padding()
+    }
+
+    // ฟังก์ชันเปิดไฟล์
+    private func openFilePanel(allowedTypes: [String]) -> String? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        let types = allowedTypes.compactMap { UTType(filenameExtension: $0) ?? .data }
+        panel.allowedContentTypes = types.isEmpty ? [.data] : types
+        panel.prompt = "Select"
+        if panel.runModal() == .OK, let url = panel.url { return url.path }
+        return nil
     }
 }
 
