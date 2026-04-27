@@ -15,6 +15,16 @@ struct SSHHost: Identifiable, Equatable {
     /// คีย์อื่น ๆ ที่ไม่ได้แมพเป็น property ตรง ๆ (key,value)
     var extraOptions: [(key: String, value: String)] = []
 
+    /// canonical account key สำหรับ Keychain — ใช้ทั้งใน HostEditor (save) และ SFTPSession (load)
+    /// trim whitespace + fallback NSUserName/alias เพื่อกัน mismatch
+    var keychainAccount: String {
+        let u = user.trimmingCharacters(in: .whitespacesAndNewlines)
+        let h = hostName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let username = u.isEmpty ? NSUserName() : u
+        let hostStr = h.isEmpty ? alias.trimmingCharacters(in: .whitespacesAndNewlines) : h
+        return "\(username)@\(hostStr)"
+    }
+
     static func == (lhs: SSHHost, rhs: SSHHost) -> Bool {
         lhs.id == rhs.id &&
         lhs.alias == rhs.alias &&

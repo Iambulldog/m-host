@@ -95,8 +95,12 @@ struct SSHView: View {
                     HostEditor(
                         host: $manager.hosts[idx],
                         onPickIdentity: { manager.pickIdentityFile() },
-                        onOpenSession: { sessionHost = manager.hosts[idx] }
+                        onOpenSession: { sessionHost = manager.hosts[idx] },
+                        loadPassword: { manager.savedPassword(for: $0) },
+                        savePassword: { pw, h in manager.savePassword(pw, for: h) },
+                        forgetCredentials: { manager.forgetCredentials(for: $0) }
                     )
+                    .id(id)  // re-create editor เมื่อ host เปลี่ยน (เพื่อ load password ใหม่)
                 } else {
                     VStack {
                         Spacer()
@@ -139,9 +143,21 @@ private struct HostEditor: View {
     @Binding var host: SSHHost
     var onPickIdentity: () -> String?
     var onOpenSession: () -> Void
+    /// load password ที่ save ใน Keychain (ถ้ามี)
+    var loadPassword: (SSHHost) -> String?
+    /// save password ลง Keychain (ถ้าว่างจะลบ)
+    var savePassword: (String, SSHHost) -> Void
+    /// ลบทุก credential (password + passphrase) ของ host
+    var forgetCredentials: (SSHHost) -> Void
+
+    @State private var password: String = ""
+    @State private var showPassword: Bool = false
+    @State private var didLoadPassword: Bool = false
+    @State private var showAdvanced: Bool = false
 
     var body: some View {
         Form {
+            // — HOST
             Section("Host") {
                 LabeledContent("Alias") {
                     TextField("alias", text: $host.alias)
@@ -153,10 +169,6 @@ private struct HostEditor: View {
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
                 }
-                LabeledContent("User") {
-                    TextField("ubuntu", text: $host.user)
-                        .textFieldStyle(.roundedBorder)
-                }
                 LabeledContent("Port") {
                     TextField("22", text: $host.port)
                         .textFieldStyle(.roundedBorder)
@@ -164,46 +176,95 @@ private struct HostEditor: View {
                 }
             }
 
-            Section("Identity") {
-                LabeledContent("IdentityFile") {
-                    HStack {
-                        TextField("~/.ssh/id_rsa", text: $host.identityFile)
+            // — CREDENTIALS (Termius-style)
+            Section("Credentials") {
+                LabeledContent {
+                    TextField("ubuntu / root", text: $host.user)
+                        .textFieldStyle(.roundedBorder)
+                } label: {
+                    Label("Username", systemImage: "person")
+                }
+
+                LabeledContent {
+                    HStack(spacing: 6) {
+                        Group {
+                            if showPassword {
+                                TextField("(ว่าง = ใช้ key อย่างเดียว)", text: $password)
+                            } else {
+                                SecureField("(ว่าง = ใช้ key อย่างเดียว)", text: $password)
+                            }
+                        }
+                        .textFieldStyle(.roundedBorder)
+                        Button {
+                            showPassword.toggle()
+                        } label: {
+                            Image(systemName: showPassword ? "eye.slash" : "eye")
+                        }
+                        .buttonStyle(.borderless)
+                        .help(showPassword ? "ซ่อน password" : "แสดง password")
+                    }
+                } label: {
+                    Label("Password", systemImage: "lock")
+                }
+
+                LabeledContent {
+                    HStack(spacing: 6) {
+                        TextField("~/.ssh/id_ed25519 (optional)", text: $host.identityFile)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(.caption, design: .monospaced))
                         Button("Browse...") {
                             if let p = onPickIdentity() { host.identityFile = p }
                         }
                     }
+                } label: {
+                    Label("SSH Key", systemImage: "key")
                 }
-            }
 
-            Section("Default Path (cd หลัง connect)") {
-                LabeledContent("Path") {
-                    TextField("/var/www/html", text: $host.defaultPath)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
-                }
-                Text("เก็บเป็น `# MhostDefaultPath:` ในไฟล์ ssh config — ปุ่ม Connect จะ ssh -t \\\"alias\\\" 'cd <path> && exec $SHELL -l' ให้อัตโนมัติ")
+                Text("Password เก็บใน macOS Keychain (เข้ารหัสกับ Secure Enclave — ไม่เคยเขียนลง ssh config) — auto-fill ตอน Connect")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
+            // — DEFAULT PATH
+            Section("Default Path") {
+                LabeledContent {
+                    TextField("/var/www/html", text: $host.defaultPath)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                } label: {
+                    Label("Path", systemImage: "folder")
+                }
+                Text("Connect แล้ว auto cd ไป path นี้ — เก็บเป็น `# MhostDefaultPath:` ใน ssh config")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            // — ADVANCED (Other options) — collapsed by default
             if !host.extraOptions.isEmpty {
-                Section("Other options") {
-                    ForEach(Array(host.extraOptions.enumerated()), id: \.offset) { _, opt in
-                        HStack {
-                            Text(opt.key).font(.system(.caption, design: .monospaced))
-                            Spacer()
-                            Text(opt.value)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.secondary)
+                Section {
+                    DisclosureGroup("Other options (\(host.extraOptions.count))",
+                                     isExpanded: $showAdvanced) {
+                        ForEach(Array(host.extraOptions.enumerated()), id: \.offset) { _, opt in
+                            HStack {
+                                Text(opt.key).font(.system(.caption, design: .monospaced))
+                                Spacer()
+                                Text(opt.value)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
             }
 
+            // — ACTIONS
             Section {
                 Button {
+                    // commit password ลง Keychain ก่อนเปิด session — กัน timing issue
+                    // ของ onChange ที่อาจยังไม่ทัน save
+                    if !password.isEmpty {
+                        savePassword(password, host)
+                    }
                     onOpenSession()
                 } label: {
                     Label("Open Session (Terminal + SFTP)", systemImage: "play.circle.fill")
@@ -211,10 +272,41 @@ private struct HostEditor: View {
                 }
                 .controlSize(.large)
                 .disabled(host.alias.trimmingCharacters(in: .whitespaces).isEmpty)
+
+                HStack {
+                    Spacer()
+                    Button(role: .destructive) {
+                        password = ""
+                        forgetCredentials(host)
+                    } label: {
+                        Label("Forget Saved Credentials", systemImage: "trash")
+                            .font(.caption)
+                    }
+                    .controlSize(.small)
+                    .help("ลบ password + passphrase ที่ save ใน Keychain ของ host นี้")
+                }
             }
         }
         .formStyle(.grouped)
-        .frame(minWidth: 360)
+        .frame(minWidth: 380)
+        .onAppear {
+            password = loadPassword(host) ?? ""
+            didLoadPassword = true
+        }
+        .onChange(of: password) { _, newVal in
+            // กัน save ตอน initial load
+            guard didLoadPassword else { return }
+            savePassword(newVal, host)
+        }
+        // ถ้า user/hostname เปลี่ยน → re-key Keychain account ของ password
+        .onChange(of: host.user) { _, _ in resaveIfNeeded() }
+        .onChange(of: host.hostName) { _, _ in resaveIfNeeded() }
+    }
+
+    /// re-save password ลง account ใหม่ (ถ้า user/hostname เปลี่ยน)
+    private func resaveIfNeeded() {
+        guard didLoadPassword, !password.isEmpty else { return }
+        savePassword(password, host)
     }
 }
 

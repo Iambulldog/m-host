@@ -27,10 +27,13 @@ struct SSHTerminalView: NSViewRepresentable {
             args = [alias]
         }
 
-        // env: เพิ่ม TERM ถ้าไม่มี (SwiftTerm จัดการให้บางส่วน แต่กันไว้)
+        // env: บังคับ xterm-256color เสมอ — Mhost.app เปิดมาจาก Finder ไม่มี TERM
+        // ที่ใช้ได้ + COLORTERM=truecolor ช่วย htop/vim/nano render สี/ตารางถูก
         var env = ProcessInfo.processInfo.environment
-        if env["TERM"] == nil { env["TERM"] = "xterm-256color" }
-        if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+        env["LC_ALL"] = env["LC_ALL"] ?? "en_US.UTF-8"
+        env["LANG"] = env["LANG"] ?? "en_US.UTF-8"
         let envArray = env.map { "\($0.key)=\($0.value)" }
 
         // start ssh

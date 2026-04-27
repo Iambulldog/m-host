@@ -92,6 +92,28 @@ final class SSHConfigManager {
         }
     }
 
+    // MARK: - Keychain credentials (Termius-style)
+
+    /// โหลด password ที่ save ไว้ใน Keychain (ถ้ามี)
+    func savedPassword(for host: SSHHost) -> String? {
+        KeychainHelper.load(kind: .userPassword, account: host.keychainAccount)
+    }
+
+    /// save password ลง Keychain — ถ้าว่างจะลบออก
+    func savePassword(_ password: String, for host: SSHHost) {
+        let account = host.keychainAccount
+        if password.isEmpty {
+            KeychainHelper.delete(kind: .userPassword, account: account)
+        } else {
+            KeychainHelper.save(password, kind: .userPassword, account: account)
+        }
+    }
+
+    /// ลบทุก credential ของ host (password + passphrase ของ key)
+    func forgetCredentials(for host: SSHHost) {
+        KeychainHelper.deleteAll(forHost: host)
+    }
+
     /// คืน path ที่ผู้ใช้เลือก (สำหรับ IdentityFile) — หรือ nil ถ้ายกเลิก
     func pickIdentityFile() -> String? {
         let panel = NSOpenPanel()

@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode
+build/
+DerivedData/
+*.xcworkspace
+*.xcuserstate
+*.xcuserdata/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+
+# SwiftPM
+/.build
+/Packages
+/Package.pins
+/Package.resolved
+
+# User settings
+*.swp
+*.swo
+*.orig
+
+# Other
+*.log
+*.tmp
+*.bak
+
+# Ignore secrets
+*.env
+secrets/

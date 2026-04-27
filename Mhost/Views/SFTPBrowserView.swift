@@ -2,9 +2,13 @@ import SwiftUI
 
 struct SFTPBrowserView: View {
     @State var session: SFTPSession
-    @State private var passwordInput: String = ""
-    @State private var showPasswordSheet: Bool = false
+    @State private var showCredentialSheet: Bool = false
+    /// kind ที่ใช้แสดงสำหรับ sheet ปัจจุบัน
+    @State private var credentialKind: SFTPSession.Credential = .userPassword
     @State private var pathInput: String = ""
+    /// status ของ download — ใช้แสดง progress/result ใน status bar
+    @State private var downloadStatus: String?
+    @State private var isDownloading: Bool = false
 
     init(host: SSHHost) {
         _session = State(initialValue: SFTPSession(host: host))
@@ -66,20 +70,35 @@ struct SFTPBrowserView: View {
                 Task { await session.connect() }
             }
         }
-        .sheet(isPresented: $showPasswordSheet) {
-            PasswordPrompt(
+        .sheet(isPresented: $showCredentialSheet) {
+            CredentialPrompt(
                 host: session.host,
+                kind: credentialKind,
                 lastError: session.lastError,
-                onCancel: { showPasswordSheet = false },
-                onSubmit: { pw in
-                    showPasswordSheet = false
-                    passwordInput = pw
-                    Task { await session.connect(password: pw) }
+                onCancel: { showCredentialSheet = false },
+                onSubmit: { secret, save in
+                    showCredentialSheet = false
+                    Task {
+                        switch credentialKind {
+                        case .keyPassphrase:
+                            await session.connect(passphrase: secret, saveToKeychain: save)
+                        case .userPassword:
+                            await session.connect(password: secret, saveToKeychain: save)
+                        case .none:
+                            break
+                        }
+                    }
                 }
             )
         }
-        .onChange(of: session.needsPassword) { _, needs in
-            if needs { showPasswordSheet = true }
+        .onChange(of: session.needs) { _, needs in
+            switch needs {
+            case .keyPassphrase, .userPassword:
+                credentialKind = needs
+                showCredentialSheet = true
+            case .none:
+                break
+            }
         }
     }
 
@@ -100,10 +119,11 @@ struct SFTPBrowserView: View {
                     .multilineTextAlignment(.center).padding(.horizontal)
                 Button {
                     Task { await session.connect() }
-                } label: { Label("ลองใหม่ (key auth)", systemImage: "arrow.clockwise") }
+                } label: { Label("ลองใหม่", systemImage: "arrow.clockwise") }
                 Button {
-                    showPasswordSheet = true
-                } label: { Label("ใช้ password", systemImage: "key") }
+                    credentialKind = .userPassword
+                    showCredentialSheet = true
+                } label: { Label("ใช้ password แทน", systemImage: "key") }
             case .idle:
                 Image(systemName: "server.rack")
                     .font(.largeTitle).foregroundStyle(.tint)
@@ -127,31 +147,88 @@ struct SFTPBrowserView: View {
 
     @ViewBuilder
     private var fileTable: some View {
-        Table(session.entries) {
-            TableColumn("Name") { e in
+        VStack(spacing: 0) {
+            Table(session.entries) {
+                TableColumn("Name") { e in
+                    HStack(spacing: 6) {
+                        Image(systemName: icon(for: e))
+                            .foregroundStyle(e.isDirectory ? Color.tint : .secondary)
+                        Text(e.name)
+                            .font(.system(.body, design: .monospaced))
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        Task { await session.enter(e) }
+                    }
+                    .contextMenu {
+                        if !e.isDirectory {
+                            Button {
+                                downloadEntry(e)
+                            } label: { Label("Download…", systemImage: "arrow.down.circle") }
+                        }
+                        Button {
+                            let pb = NSPasteboard.general
+                            pb.clearContents()
+                            pb.setString(session.remotePath(of: e), forType: .string)
+                        } label: { Label("Copy path", systemImage: "doc.on.doc") }
+                    }
+                }
+                TableColumn("Size") { e in
+                    Text(e.displaySize)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 60, ideal: 80, max: 120)
+                TableColumn("Modified") { e in
+                    Text(e.displayDate)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 120, ideal: 140, max: 180)
+            }
+            // download status bar
+            if let status = downloadStatus {
+                Divider()
                 HStack(spacing: 6) {
-                    Image(systemName: icon(for: e))
-                        .foregroundStyle(e.isDirectory ? Color.tint : .secondary)
-                    Text(e.name)
-                        .font(.system(.body, design: .monospaced))
+                    if isDownloading {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "checkmark.circle").foregroundStyle(.green)
+                    }
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button { downloadStatus = nil } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.borderless)
                 }
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    Task { await session.enter(e) }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(.bar)
+            }
+        }
+    }
+
+    private func downloadEntry(_ e: SFTPEntry) {
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = e.name
+        panel.message = "บันทึก \(e.name) จาก \(session.host.alias)"
+        panel.prompt = "Download"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        isDownloading = true
+        downloadStatus = "กำลังดาวน์โหลด \(e.name)…"
+        Task {
+            let result = await session.download(e, to: url)
+            await MainActor.run {
+                isDownloading = false
+                switch result {
+                case .success:
+                    downloadStatus = "✓ บันทึก \(url.lastPathComponent) แล้ว (\(e.displaySize))"
+                case .failure(let err):
+                    downloadStatus = "✗ ดาวน์โหลดไม่สำเร็จ: \(err.localizedDescription)"
                 }
             }
-            TableColumn("Size") { e in
-                Text(e.displaySize)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 60, ideal: 80, max: 120)
-            TableColumn("Modified") { e in
-                Text(e.displayDate)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 120, ideal: 140, max: 180)
         }
     }
 
@@ -162,34 +239,70 @@ struct SFTPBrowserView: View {
     }
 }
 
-private struct PasswordPrompt: View {
+private struct CredentialPrompt: View {
     let host: SSHHost
+    let kind: SFTPSession.Credential
     let lastError: String?
     var onCancel: () -> Void
-    var onSubmit: (String) -> Void
+    /// (secret, saveToKeychain)
+    var onSubmit: (String, Bool) -> Void
 
-    @State private var password: String = ""
+    @State private var secret: String = ""
+    @State private var saveToKeychain: Bool = true  // default ON เหมือน Termius
+
+    private var title: String {
+        switch kind {
+        case .keyPassphrase:
+            return "Passphrase ของ key"
+        case .userPassword:
+            return "รหัสผ่านสำหรับ \(host.user)@\(host.hostName.isEmpty ? host.alias : host.hostName)"
+        case .none:
+            return ""
+        }
+    }
+
+    private var placeholder: String {
+        switch kind {
+        case .keyPassphrase: return "passphrase"
+        case .userPassword: return "password"
+        case .none: return ""
+        }
+    }
+
+    private var subtitle: String? {
+        switch kind {
+        case .keyPassphrase:
+            return "key มี passphrase — ใส่เพื่อปลดล็อค key"
+        case .userPassword, .none:
+            return nil
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("รหัสผ่านสำหรับ \(host.user)@\(host.hostName.isEmpty ? host.alias : host.hostName)")
-                .font(.headline)
+            Text(title).font(.headline)
+            if let s = subtitle {
+                Text(s).font(.caption).foregroundStyle(.secondary)
+            }
             if let err = lastError {
                 Text(err).font(.caption).foregroundStyle(.red).lineLimit(3)
             }
-            SecureField("password", text: $password)
+            SecureField(placeholder, text: $secret)
                 .textFieldStyle(.roundedBorder)
-                .onSubmit { onSubmit(password) }
+                .onSubmit { onSubmit(secret, saveToKeychain) }
+            Toggle("บันทึกใน Keychain", isOn: $saveToKeychain)
+                .toggleStyle(.checkbox)
+                .help("ครั้งหน้าจะ auto-fill ให้ — เก็บไว้ใน macOS Keychain ที่เข้ารหัสด้วย Secure Enclave")
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { onCancel() }
-                Button("Connect") { onSubmit(password) }
+                Button("Connect") { onSubmit(secret, saveToKeychain) }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(password.isEmpty)
+                    .disabled(secret.isEmpty)
             }
         }
         .padding(20)
-        .frame(width: 380)
+        .frame(width: 400)
     }
 }
 
