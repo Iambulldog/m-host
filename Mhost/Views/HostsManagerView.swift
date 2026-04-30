@@ -8,6 +8,9 @@ struct HostsManagerView: View {
     @State private var lastSuccessMessage: String = ""
     @State private var showSuccessBanner: Bool = false
 
+    let onOpenTerminal: ((SSHHost) -> Void)? = nil
+    let onOpenSFTP: ((SSHHost) -> Void)? = nil
+
     private var filteredEntries: [HostEntry] {
         let hostEntries = manager.entries.filter { !$0.isComment }
         if searchText.isEmpty { return hostEntries }
@@ -26,6 +29,7 @@ struct HostsManagerView: View {
             entryList
             errorBar
         }
+        .padding()
         .onAppear { manager.loadEntries() }
         .onChange(of: manager.errorMessage) { _, newValue in
             if newValue == nil {
@@ -110,7 +114,6 @@ struct HostsManagerView: View {
         .padding(8)
         .background(.quaternary)
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .padding(.horizontal)
         .padding(.bottom, 8)
     }
 
@@ -126,7 +129,6 @@ struct HostsManagerView: View {
             .disabled(!manager.canRedo)
             Spacer()
         }
-        .padding(.horizontal)
         .padding(.vertical, 4)
     }
 
@@ -141,11 +143,21 @@ struct HostsManagerView: View {
         } else {
             List {
                 ForEach(filteredEntries) { entry in
-                    HostEntryRow(entry: entry, onToggle: {
-                        manager.toggleEntry(entry)
-                    }, onDelete: {
-                        entryToDelete = entry
-                    })
+                    HostEntryRow(
+                        entry: entry,
+                        onToggle: { manager.toggleEntry(entry) },
+                        onDelete: { entryToDelete = entry },
+                        onOpenTerminal: {
+                            if let host = manager.findHost(for: entry) {
+                                onOpenTerminal?(host)
+                            }
+                        },
+                        onOpenSFTP: {
+                            if let host = manager.findHost(for: entry) {
+                                onOpenSFTP?(host)
+                            }
+                        }
+                    )
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
@@ -175,6 +187,8 @@ struct HostEntryRow: View {
     let entry: HostEntry
     let onToggle: () -> Void
     let onDelete: () -> Void
+    let onOpenTerminal: (() -> Void)?
+    let onOpenSFTP: (() -> Void)?
 
     @State private var isHovering = false
 
@@ -219,6 +233,22 @@ struct HostEntryRow: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
+        .contextMenu {
+            if let onOpenTerminal {
+                Button {
+                    onOpenTerminal()
+                } label: {
+                    Label("Open Terminal", systemImage: "terminal")
+                }
+            }
+            if let onOpenSFTP {
+                Button {
+                    onOpenSFTP()
+                } label: {
+                    Label("Open SFTP", systemImage: "folder")
+                }
+            }
+        }
     }
 }
 

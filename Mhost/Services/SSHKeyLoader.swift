@@ -141,11 +141,17 @@ enum SSHKeyLoader {
         ]
     }
 
-    /// ตรวจว่า key file มี passphrase หรือไม่ (ดูจาก ciphername ใน OpenSSH header)
+    /// ตรวจว่า key file มี passphrase หรือไม่
+    /// - OpenSSH: ดู ciphername ใน header (none = ไม่เข้ารหัส)
+    /// - PKCS#1: ดู `Proc-Type: 4,ENCRYPTED` หรือ `DEK-Info`
     static func isEncrypted(at path: String) -> Bool {
         let expanded = (path as NSString).expandingTildeInPath
         guard let pem = try? String(contentsOfFile: expanded, encoding: .utf8) else {
             return false
+        }
+        // PKCS#1 RSA — ใช้ DEK-Info header ตอนเข้ารหัส
+        if pem.contains("BEGIN RSA PRIVATE KEY") {
+            return pem.contains("Proc-Type: 4,ENCRYPTED") || pem.contains("DEK-Info")
         }
         guard pem.contains("BEGIN OPENSSH PRIVATE KEY") else { return false }
         let base64 = pem.components(separatedBy: "\n")
@@ -153,7 +159,6 @@ enum SSHKeyLoader {
             .joined()
         guard let data = Data(base64Encoded: base64), data.count > 24 else { return false }
 
-        // skip 15 bytes magic, อ่าน ciphername (length-prefixed string)
         var reader = Reader(data: data)
         do {
             _ = try reader.readRaw(15)
@@ -257,55 +262,18 @@ enum SSHKeyLoader {
         }
     }
 
-    /// load RSA private key — V1 ยังไม่รองรับ throw ให้ fallback ไป password
-    /// (Citadel version ที่ install อยู่ public RSA constructor ไม่ตรงกับที่เคยมี —
-    /// ไว้รองรับใน V2 ผ่าน NIOSSH parser)
+    /// load RSA private key — Citadel 0.12.1 ไม่มี public API โหลด RSA จากไฟล์
+    /// (init รับ UnsafeMutablePointer<BIGNUM> จาก BoringSSL เท่านั้น) — เราจึงสลับไปใช้
+    /// `/usr/bin/sftp` subprocess ใน SFTPSession แทน ซึ่งรองรับทุก key type ที่ ssh ของระบบรองรับ
+    /// (ดู SFTPSession.swift)
     static func loadRSA(at path: String) throws -> Insecure.RSA.PrivateKey {
         throw LoadError.unsupportedKeyType(
-            "ssh-rsa — V1 ยังไม่รองรับ RSA key auth ใช้ password (sheet ถัดไป) หรือสร้าง ed25519 key ใหม่: ssh-keygen -t ed25519"
+            "ssh-rsa via Citadel — เลิกใช้แล้ว เพราะ Mhost SFTP สลับไปใช้ /usr/bin/sftp subprocess"
         )
     }
 
-    /// load RSA ที่มี passphrase — ใช้ ssh-keygen ถอด แล้วโหลดต่อ
     static func loadRSA(at path: String, passphrase: String) throws -> Insecure.RSA.PrivateKey {
-        let expanded = (path as NSString).expandingTildeInPath
-        guard FileManager.default.fileExists(atPath: expanded) else {
-            throw LoadError.fileNotFound(expanded)
-        }
-
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mhost-key-\(UUID().uuidString)")
-        do {
-            let raw = try Data(contentsOf: URL(fileURLWithPath: expanded))
-            try raw.write(to: tmp)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600],
-                                                  ofItemAtPath: tmp.path)
-        } catch {
-            throw LoadError.readError(error.localizedDescription)
-        }
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
-        proc.arguments = ["-p", "-f", tmp.path, "-P", passphrase, "-N", ""]
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-        proc.standardOutput = Pipe()
-
-        do { try proc.run(); proc.waitUntilExit() }
-        catch { throw LoadError.readError("เรียก ssh-keygen ไม่ได้: \(error.localizedDescription)") }
-
-        if proc.terminationStatus != 0 {
-            let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
-                                encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if errStr.lowercased().contains("passphrase") {
-                throw LoadError.wrongPassphrase
-            }
-            throw LoadError.readError("ssh-keygen exit \(proc.terminationStatus): \(errStr)")
-        }
-
-        return try loadRSA(at: tmp.path)
+        throw LoadError.unsupportedKeyType("ssh-rsa via Citadel — เลิกใช้แล้ว")
     }
 
     /// โหลด key อัตโนมัติ — ตรวจ type ก่อน เลือก loader ที่ถูก

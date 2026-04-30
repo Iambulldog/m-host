@@ -3,6 +3,7 @@ import SwiftUI
 struct MkcertView: View {
     @State private var manager = MkcertManager()
     @State private var showFullLog = false
+    @State private var domains: [String] = [""]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -109,11 +110,28 @@ struct MkcertView: View {
                     }
                 }
 
-                Section("Domain") {
-                    TextField("Domain Name:", text: $manager.domain,
-                              prompt: Text("เช่น localhost หรือ myapp.local หรือ *.example.com"))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
+                Section("Domains (รองรับหลายโดเมน)") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(domains.indices, id: \.self) { idx in
+                            HStack {
+                                TextField("Domain #\(idx+1)", text: $domains[idx], prompt: Text("เช่น domain.com หรือ *.example.com"))
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.body, design: .monospaced))
+                                if domains.count > 1 {
+                                    Button(action: { domains.remove(at: idx) }) {
+                                        Image(systemName: "minus.circle.fill").foregroundStyle(.red)
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                            }
+                        }
+                        Button(action: { domains.append("") }) {
+                            Label("เพิ่ม domain", systemImage: "plus.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .padding(.top, 4)
+                        Text("ตัวอย่าง: domain1.com domain2.com *.example.com\nสามารถเพิ่มหลายโดเมนในไฟล์เดียวได้").font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
 
                 Section("Output Directory (เลือกที่เก็บไฟล์)") {
@@ -135,6 +153,8 @@ struct MkcertView: View {
 
                 Section {
                     Button {
+                        let joined = domains.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: " ")
+                        manager.domain = joined
                         Task { await manager.runMkcert() }
                     } label: {
                         HStack {
@@ -150,7 +170,7 @@ struct MkcertView: View {
                     .disabled(
                         manager.isRunning ||
                         !manager.mkcertInstalled ||
-                        manager.domain.trimmingCharacters(in: .whitespaces).isEmpty ||
+                        domains.allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ||
                         manager.outputDirectory == nil
                     )
                 }

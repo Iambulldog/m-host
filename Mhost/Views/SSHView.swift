@@ -4,145 +4,362 @@ import SwiftUI
 struct SSHView: View {
     @State private var manager = SSHConfigManager()
     @State private var selection: UUID?
-    /// host ที่กำลัง open session อยู่ (เปิดเป็น sheet)
-    @State private var sessionHost: SSHHost?
+    @State private var showColumnView: Bool = false
+    @State private var editingHost: SSHHost? = nil
+
+    // SessionTab: เก็บ session ที่เปิดในแท็บ
+    struct SessionTab: Identifiable, Equatable {
+        enum Kind { case terminal, sftp }
+        let id: UUID = UUID()
+        let host: SSHHost
+        let kind: Kind
+        var tabTitle: String { "\(host.alias) [\(kind == .terminal ? "Terminal" : "SFTP")]" }
+        var tabIcon: String { kind == .terminal ? "terminal" : "folder" }
+        // sessionKey: ใช้เช็คซ้ำ (host id + kind)
+        var sessionKey: String { "\(host.id.uuidString)-\(kind == .terminal ? "t" : "s")" }
+    }
+    // --- เพิ่ม struct สำหรับจำ state ต่อ sessionKey ---
+    struct SessionState {
+        var password: String? = nil // สำหรับ SFTP (หรือ passphrase)
+    }
+    @State private var sessions: [SessionTab] = []
+    // แยก selection ของ Terminal กับ SFTP — แต่ละ panel เก็บแท็บที่เลือกของตัวเอง
+    @State private var selectedTerminalKey: String? = nil
+    @State private var selectedSFTPKey: String? = nil
+    // สัดส่วนความสูงของ SFTP panel เมื่อเปิดทั้งสอง kind พร้อมกัน (drag splitter ปรับได้)
+    @State private var sftpFraction: CGFloat = 0.5
+    @State private var sessionStates: [String: SessionState] = [:]
+    @State private var sftpSessions: [String: SFTPSession] = [:] // เพิ่มสำหรับคง session SFTP
+    @State private var searchText: String = ""
 
     var body: some View {
-        @Bindable var manager = manager
-
-        return VStack(spacing: 0) {
-            // Header
-            HStack {
-                Image(systemName: "terminal")
-                    .foregroundStyle(.tint)
-                Text("SSH Config")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    manager.load()
-                } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Reload")
-                Button {
-                    manager.save()
-                } label: { Label("Save", systemImage: "square.and.arrow.down") }
-            }
-            .padding()
-
-            // Config path bar
-            HStack(spacing: 8) {
-                Image(systemName: "doc.text").foregroundStyle(.secondary)
-                Text(manager.configPath)
-                    .font(.system(.caption, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                Spacer()
-                Button("Browse...") { manager.pickConfigFile() }
-                    .controlSize(.small)
-            }
-            .padding(.horizontal)
-            .padding(.bottom, 8)
-
-            Divider()
-
-            HSplitView {
-                // Left: list of hosts
-                VStack(spacing: 0) {
-                    HStack {
-                        Text("\(manager.hosts.count) host\(manager.hosts.count == 1 ? "" : "s")")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Button {
-                            manager.addHost()
-                            selection = manager.hosts.last?.id
-                        } label: { Image(systemName: "plus") }
-                            .help("เพิ่ม host ใหม่")
-                        Button {
-                            if let id = selection,
-                               let h = manager.hosts.first(where: { $0.id == id }) {
-                                manager.deleteHost(h)
-                                selection = nil
-                            }
-                        } label: { Image(systemName: "minus") }
-                            .help("ลบ host")
-                            .disabled(selection == nil)
-                    }
-                    .padding(8)
-
-                    List(selection: $selection) {
-                        ForEach(manager.hosts) { h in
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(h.alias).font(.system(.body, design: .monospaced))
-                                    if !h.hostName.isEmpty {
-                                        Text("\(h.user.isEmpty ? "" : h.user + "@")\(h.hostName)")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer()
-                            }
-                            .tag(h.id)
-                        }
-                    }
-                    .frame(minWidth: 200)
-                }
-                .frame(minWidth: 220)
-
-                // Right: editor
-                if let id = selection,
-                   let idx = manager.hosts.firstIndex(where: { $0.id == id }) {
-                    HostEditor(
-                        host: $manager.hosts[idx],
-                        onPickIdentity: { manager.pickIdentityFile() },
-                        onOpenSession: { sessionHost = manager.hosts[idx] },
-                        loadPassword: { manager.savedPassword(for: $0) },
-                        savePassword: { pw, h in manager.savePassword(pw, for: h) },
-                        forgetCredentials: { manager.forgetCredentials(for: $0) }
-                    )
-                    .id(id)  // re-create editor เมื่อ host เปลี่ยน (เพื่อ load password ใหม่)
-                } else {
-                    VStack {
-                        Spacer()
-                        Text("เลือก host ทางซ้าย หรือกด + เพื่อเพิ่ม host ใหม่")
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-            }
-
-            Divider()
-
-            // Status bar
-            HStack {
-                if let err = manager.errorMessage {
-                    Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
-                    Text(err).foregroundStyle(.red)
-                } else {
-                    Image(systemName: "checkmark.circle").foregroundStyle(.secondary)
-                    Text(manager.statusMessage.isEmpty ? "Ready" : manager.statusMessage)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .font(.caption)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.bar)
-        }
-        .sheet(item: $sessionHost) { host in
-            SSHSessionView(host: host) {
-                sessionHost = nil
-            }
+        GeometryReader { geometry in
+            SSHViewLayout(
+                geometry: geometry,
+                editingHost: $editingHost,
+                manager: manager,
+                selection: $selection,
+                showColumnView: $showColumnView,
+                sessions: $sessions,
+                selectedTerminalKey: $selectedTerminalKey,
+                selectedSFTPKey: $selectedSFTPKey,
+                sftpFraction: $sftpFraction,
+                sftpSessions: $sftpSessions,
+                searchText: $searchText
+            )
         }
     }
 }
 
+private struct SSHViewLayout: View {
+    let geometry: GeometryProxy
+    @Binding var editingHost: SSHHost?
+    var manager: SSHConfigManager
+    @Binding var selection: UUID?
+    @Binding var showColumnView: Bool
+    @Binding var sessions: [SSHView.SessionTab]
+    @Binding var selectedTerminalKey: String?
+    @Binding var selectedSFTPKey: String?
+    @Binding var sftpFraction: CGFloat
+
+    /// keyboard highlight index ใน filtered list (แยกจาก selection ที่ใช้กับ editor)
+    @State private var highlightedIndex: Int? = nil
+    @FocusState private var listFocused: Bool
+    @Binding var sftpSessions: [String: SFTPSession]
+    @Binding var searchText: String
+
+    private var filteredHosts: [SSHHost] {
+        if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return manager.hosts
+        }
+        let q = searchText.lowercased()
+        return manager.hosts.filter {
+            $0.alias.lowercased().contains(q) ||
+            $0.hostName.lowercased().contains(q) ||
+            $0.user.lowercased().contains(q)
+        }
+    }
+
+    var body: some View {
+        let safeWidth = geometry.size.width.isFinite && !geometry.size.width.isNaN && geometry.size.width > 0 ? geometry.size.width : 1
+        let sidebarWidth = max(safeWidth * 0.22, 220)
+        // editor ต้องกว้างพอให้ field กับ label แสดงครบ — บังคับขั้นต่ำ 340pt
+        let rightbarWidth = max(safeWidth * 0.28, 340)
+        let mainWidth = editingHost == nil
+            ? max(safeWidth - sidebarWidth, 1)
+            : max(safeWidth - sidebarWidth - rightbarWidth, 1)
+        HStack(spacing: 0) {
+            // Sidebar
+            VStack(spacing: 0) {
+                HStack {
+                    Text("SSH Hosts")
+                        .font(.headline)
+                    Spacer()
+                    Button(action: { showColumnView.toggle() }) {
+                        Image(systemName: showColumnView ? "list.bullet" : "square.grid.2x2")
+                            .help(showColumnView ? "แสดงแบบ List" : "แสดงแบบ Column")
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+                // Search bar — ↓ arrow ย้าย focus ไป list, Enter connect อันแรก
+                TextField("ค้นหา SSH host...", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 4)
+                    .onKeyPress(.downArrow) {
+                        guard !filteredHosts.isEmpty else { return .handled }
+                        highlightedIndex = min((highlightedIndex ?? -1) + 1, filteredHosts.count - 1)
+                        listFocused = true
+                        return .handled
+                    }
+                    .onKeyPress(.return) {
+                        // Enter จาก search → connect อันแรกเลย
+                        if let h = filteredHosts.first {
+                            openSession(for: h, kind: .terminal)
+                        }
+                        return .handled
+                    }
+                    .onChange(of: searchText) { _, _ in highlightedIndex = nil }
+                if showColumnView {
+                    // Column/Grid view
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                            ForEach(filteredHosts) { h in
+                                SSHHostGridItemView(
+                                    host: h,
+                                    isSelected: selection == h.id,
+                                    onSelect: {
+                                        print("[DEBUG] Grid select host: \(h.alias)")
+                                        selection = h.id
+                                    },
+                                    onEdit: {
+                                        print("[DEBUG] Grid edit host: \(h.alias)")
+                                        editingHost = h
+                                    },
+                                    onOpenTerminal: { openSession(for: h, kind: .terminal) },
+                                    onOpenSFTP: { openSession(for: h, kind: .sftp) }
+                                )
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 8)
+                    }
+                } else {
+                    // List view — keyboard navigable
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(Array(filteredHosts.enumerated()), id: \.element.id) { idx, h in
+                                    HStack(spacing: 6) {
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(h.alias).font(.system(.body, design: .monospaced))
+                                            if !h.hostName.isEmpty {
+                                                Text("\(h.user.isEmpty ? "" : h.user + "@")\(h.hostName)")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        Spacer()
+                                        Button { openSession(for: h, kind: .terminal) } label: {
+                                            Image(systemName: "terminal").foregroundStyle(Color.accentColor)
+                                        }
+                                        .buttonStyle(.plain).help("เชื่อมต่อ Terminal")
+                                        Button { openSession(for: h, kind: .sftp) } label: {
+                                            Image(systemName: "folder").foregroundStyle(Color.accentColor)
+                                        }
+                                        .buttonStyle(.plain).help("เชื่อมต่อ SFTP")
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        highlightedIndex == idx
+                                            ? Color.accentColor.opacity(0.20)
+                                            : (selection == h.id ? Color.accentColor.opacity(0.09) : Color.clear)
+                                    )
+                                    .contentShape(Rectangle())
+                                    .id(h.id)
+                                    .onTapGesture {
+                                        selection = h.id
+                                        editingHost = h
+                                        highlightedIndex = idx
+                                    }
+                                    Divider().padding(.leading, 10)
+                                }
+                            }
+                        }
+                        .focusable()
+                        .focused($listFocused)
+                        .onKeyPress(.upArrow) {
+                            guard !filteredHosts.isEmpty else { return .handled }
+                            let next = max(0, (highlightedIndex ?? 1) - 1)
+                            highlightedIndex = next
+                            proxy.scrollTo(filteredHosts[next].id, anchor: .center)
+                            return .handled
+                        }
+                        .onKeyPress(.downArrow) {
+                            guard !filteredHosts.isEmpty else { return .handled }
+                            let next = min(filteredHosts.count - 1, (highlightedIndex ?? -1) + 1)
+                            highlightedIndex = next
+                            proxy.scrollTo(filteredHosts[next].id, anchor: .center)
+                            return .handled
+                        }
+                        .onKeyPress(.return) {
+                            guard let idx = highlightedIndex, idx < filteredHosts.count else { return .ignored }
+                            openSession(for: filteredHosts[idx], kind: .terminal)
+                            return .handled
+                        }
+                    }
+                    .frame(minWidth: 220)
+                }
+            }
+            .padding(.vertical, 8)
+            .frame(width: sidebarWidth)
+            .frame(maxHeight: .infinity)
+            
+            Divider()
+            
+            // Main SFTP/Terminal — resizable, state-preserving
+            GeometryReader { mainGeo in
+                let totalH = max(mainGeo.size.height, 1)
+                let hasSFTP = sessions.contains { $0.kind == .sftp }
+                let hasTerminal = sessions.contains { $0.kind == .terminal }
+                let bothOpen = hasSFTP && hasTerminal
+
+                if !hasSFTP && !hasTerminal {
+                    VStack {
+                        Spacer()
+                        Text("ยังไม่มี session — เลือก host แล้วกดปุ่ม terminal/folder ที่ sidebar")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                        Spacer()
+                    }
+                    .frame(width: mainGeo.size.width, height: totalH)
+                } else {
+                    let sftpH: CGFloat = bothOpen
+                        ? max(120, min(totalH - 120, totalH * sftpFraction))
+                        : (hasSFTP ? totalH : 0)
+                    let splitterH: CGFloat = bothOpen ? 6 : 0
+
+                    VStack(spacing: 0) {
+                        SFTPSessionPanel(
+                            sessions: sessions,
+                            selectedKey: $selectedSFTPKey,
+                            onClose: closeSession,
+                            sftpSessions: $sftpSessions
+                        )
+                        .frame(height: sftpH)
+                        .clipped()
+
+                        PanelSplitter(fraction: $sftpFraction, totalHeight: totalH)
+                            .frame(height: splitterH)
+                            .opacity(bothOpen ? 1 : 0)
+                            .allowsHitTesting(bothOpen)
+
+                        TerminalSessionPanel(
+                            sessions: sessions,
+                            selectedKey: $selectedTerminalKey,
+                            onClose: closeSession
+                        )
+                        .frame(maxHeight: .infinity)
+                        .clipped()
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .frame(width: mainWidth)
+            .frame(maxHeight: .infinity)
+            
+            // Right Editor Bar
+            if let editing = editingHost {
+                Divider()
+                ZStack(alignment: .topTrailing) {
+                    VStack {
+                        HostEditor(
+                            host: Binding(
+                                get: { editing },
+                                set: { newValue in
+                                    if let idx = manager.hosts.firstIndex(where: { $0.id == newValue.id }) {
+                                        manager.hosts[idx] = newValue
+                                    }
+                                    // sync editing state ด้วย เพื่อให้ค่าใน editor ตามทันค่าล่าสุด
+                                    editingHost = newValue
+                                }),
+                            onPickIdentity: { manager.pickIdentityFile() },
+                            onSave: { pw in
+                                // เขียน ssh config ลงดิสก์
+                                manager.save()
+                                // เก็บ/ลบ password ใน Keychain
+                                manager.savePassword(pw, for: editing)
+                            },
+                            loadPassword: { host in manager.savedPassword(for: host) },
+                            savePassword: { pw, host in manager.savePassword(pw, for: host) },
+                            forgetCredentials: { host in manager.forgetCredentials(for: host) }
+                        )
+                    }
+                    .frame(width: rightbarWidth)
+                    .frame(maxHeight: .infinity)
+                    
+                    Button(action: { editingHost = nil }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundStyle(.secondary)
+                            .padding(8)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .background(.bar)
+            }
+        }
+    }
+
+    // MARK: - Session Tab Logic
+    private func openSession(for host: SSHHost, kind: SSHView.SessionTab.Kind) {
+        let key = "\(host.id.uuidString)-\(kind == .terminal ? "t" : "s")"
+        if !sessions.contains(where: { $0.sessionKey == key }) {
+            sessions.append(SSHView.SessionTab(host: host, kind: kind))
+        }
+        if kind == .sftp {
+            let needsNew: Bool
+            if let existing = sftpSessions[key] {
+                switch existing.status {
+                case .connecting, .connected: needsNew = false
+                case .idle, .failed: needsNew = true
+                }
+            } else {
+                needsNew = true
+            }
+            if needsNew {
+                sftpSessions[key] = SFTPSession(host: host)
+            }
+        }
+        // เลือกแท็บใหม่ใน panel ที่ตรง kind — ไม่กระทบ selection ของอีก panel
+        if kind == .terminal {
+            selectedTerminalKey = key
+        } else {
+            selectedSFTPKey = key
+        }
+    }
+
+    private func closeSession(_ tab: SSHView.SessionTab) {
+        sessions.removeAll { $0.sessionKey == tab.sessionKey }
+        if tab.kind == .terminal, selectedTerminalKey == tab.sessionKey {
+            selectedTerminalKey = sessions.last(where: { $0.kind == .terminal })?.sessionKey
+        } else if tab.kind == .sftp, selectedSFTPKey == tab.sessionKey {
+            selectedSFTPKey = sessions.last(where: { $0.kind == .sftp })?.sessionKey
+        }
+    }
+}
+// --- END SSHView ---
+
 private struct HostEditor: View {
     @Binding var host: SSHHost
     var onPickIdentity: () -> String?
-    var onOpenSession: () -> Void
+    /// บันทึก host เข้า ssh config + เก็บ password ลง Keychain
+    var onSave: (_ password: String) -> Void
     /// load password ที่ save ใน Keychain (ถ้ามี)
     var loadPassword: (SSHHost) -> String?
     /// save password ลง Keychain (ถ้าว่างจะลบ)
@@ -154,47 +371,72 @@ private struct HostEditor: View {
     @State private var showPassword: Bool = false
     @State private var didLoadPassword: Bool = false
     @State private var showAdvanced: Bool = false
+    @State private var saveFlash: Bool = false
+
+    @ViewBuilder
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.headline)
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func fieldLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
 
     var body: some View {
-        Form {
-            // — HOST
-            Section("Host") {
-                LabeledContent("Alias") {
-                    TextField("alias", text: $host.alias)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                // เว้นที่ให้ปุ่ม X ที่มุมขวาบน
+                Spacer().frame(height: 24)
+
+                // — HOST
+                sectionHeader("Host")
+                VStack(alignment: .leading, spacing: 10) {
+                    fieldLabel("Alias")
+                    TextField("เช่น pangpang-1", text: $host.alias)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
-                }
-                LabeledContent("HostName") {
+                        .labelsHidden()
+
+                    fieldLabel("HostName")
                     TextField("192.168.1.10 หรือ example.com", text: $host.hostName)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
-                }
-                LabeledContent("Port") {
+                        .labelsHidden()
+
+                    fieldLabel("Port")
                     TextField("22", text: $host.port)
                         .textFieldStyle(.roundedBorder)
-                        .frame(width: 80)
+                        .labelsHidden()
+                        .frame(maxWidth: 120, alignment: .leading)
                 }
-            }
 
-            // — CREDENTIALS (Termius-style)
-            Section("Credentials") {
-                LabeledContent {
+                Divider()
+
+                // — CREDENTIALS
+                sectionHeader("Credentials")
+                VStack(alignment: .leading, spacing: 10) {
+                    fieldLabel("Username")
                     TextField("ubuntu / root", text: $host.user)
                         .textFieldStyle(.roundedBorder)
-                } label: {
-                    Label("Username", systemImage: "person")
-                }
+                        .labelsHidden()
 
-                LabeledContent {
+                    fieldLabel("Password")
                     HStack(spacing: 6) {
                         Group {
                             if showPassword {
-                                TextField("(ว่าง = ใช้ key อย่างเดียว)", text: $password)
+                                TextField("ว่าง = ใช้ key อย่างเดียว", text: $password)
                             } else {
-                                SecureField("(ว่าง = ใช้ key อย่างเดียว)", text: $password)
+                                SecureField("ว่าง = ใช้ key อย่างเดียว", text: $password)
                             }
                         }
                         .textFieldStyle(.roundedBorder)
+                        .labelsHidden()
                         Button {
                             showPassword.toggle()
                         } label: {
@@ -203,111 +445,342 @@ private struct HostEditor: View {
                         .buttonStyle(.borderless)
                         .help(showPassword ? "ซ่อน password" : "แสดง password")
                     }
-                } label: {
-                    Label("Password", systemImage: "lock")
-                }
 
-                LabeledContent {
-                    HStack(spacing: 6) {
-                        TextField("~/.ssh/id_ed25519 (optional)", text: $host.identityFile)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.caption, design: .monospaced))
+                    fieldLabel("SSH Key")
+                    TextField("~/.ssh/id_ed25519 (optional)", text: $host.identityFile)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                        .labelsHidden()
+                        .truncationMode(.middle)
+                    HStack {
                         Button("Browse...") {
                             if let p = onPickIdentity() { host.identityFile = p }
                         }
+                        .font(.caption)
+                        Spacer()
                     }
-                } label: {
-                    Label("SSH Key", systemImage: "key")
+
+                    Text("Password เก็บใน macOS Keychain (เข้ารหัสกับ Secure Enclave — ไม่เคยเขียนลง ssh config) — auto-fill ตอน Connect")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
-                Text("Password เก็บใน macOS Keychain (เข้ารหัสกับ Secure Enclave — ไม่เคยเขียนลง ssh config) — auto-fill ตอน Connect")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
+                Divider()
 
-            // — DEFAULT PATH
-            Section("Default Path") {
-                LabeledContent {
+                // — DEFAULT PATH
+                sectionHeader("Default Path")
+                VStack(alignment: .leading, spacing: 10) {
+                    fieldLabel("Path")
                     TextField("/var/www/html", text: $host.defaultPath)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
-                } label: {
-                    Label("Path", systemImage: "folder")
+                        .labelsHidden()
+
+                    Text("Connect แล้ว auto cd ไป path นี้ — เก็บเป็น `# MhostDefaultPath:` ใน ssh config")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text("Connect แล้ว auto cd ไป path นี้ — เก็บเป็น `# MhostDefaultPath:` ใน ssh config")
-                    .font(.caption2)
+
+                // — ADVANCED (Other options) — collapsed by default
+                if !host.extraOptions.isEmpty {
+                    Divider()
+                    DisclosureGroup("Other options (\(host.extraOptions.count))",
+                                    isExpanded: $showAdvanced) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(host.extraOptions.enumerated()), id: \.offset) { _, opt in
+                                HStack {
+                                    Text(opt.key).font(.system(.caption, design: .monospaced))
+                                    Spacer()
+                                    Text(opt.value)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+                }
+
+                Divider()
+
+                // — ACTIONS
+                VStack(alignment: .leading, spacing: 8) {
+                    Button(action: {
+                        if !password.isEmpty { savePassword("", host) }
+                        password = ""
+                        forgetCredentials(host)
+                    }) {
+                        Label("Forget Password/Key", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+
+                    Button(action: {
+                        onSave(password)
+                        // flash icon เพื่อ feedback ว่ากดสำเร็จ
+                        saveFlash = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                            saveFlash = false
+                        }
+                    }) {
+                        Label(saveFlash ? "Saved" : "Save",
+                              systemImage: saveFlash ? "checkmark.circle.fill" : "square.and.arrow.down")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .keyboardShortcut("s", modifiers: [.command])
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            // โหลด password จาก Keychain (ถ้ามี)
+            if !didLoadPassword {
+                didLoadPassword = true
+                DispatchQueue.main.async {
+                    if let pw = loadPassword(host) {
+                        password = pw
+                    }
+                }
+            }
+        }
+    }
+}
+// --- END HostEditor ---
+
+// MARK: - SSH Host Grid Item View
+private struct SSHHostGridItemView: View {
+    let host: SSHHost
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onEdit: () -> Void
+    let onOpenTerminal: () -> Void
+    let onOpenSFTP: () -> Void
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text(host.alias).font(.system(.body, design: .monospaced))
+                if !host.hostName.isEmpty {
+                    Text("\(host.user.isEmpty ? "" : host.user + "@")\(host.hostName)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button(action: onOpenTerminal) {
+                Image(systemName: "terminal")
+                    .foregroundStyle(Color.accentColor)
+            }
+            .buttonStyle(.plain)
+            .help("เชื่อมต่อ Terminal")
+            Button(action: onOpenSFTP) {
+                Image(systemName: "folder")
+                    .foregroundStyle(Color.accentColor)
+            }
+            .buttonStyle(.plain)
+            .help("เชื่อมต่อ SFTP")
+        }
+        .padding(6)
+        .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
+        .cornerRadius(6)
+        .onTapGesture {
+            onSelect()
+            onEdit()
+        }
+    }
+}
+
+// MARK: - Tab Button (แชร์ระหว่าง terminal panel กับ sftp panel)
+private struct SessionTabButton: View {
+    let tab: SSHView.SessionTab
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: tab.tabIcon)
+                .font(.system(size: 12, weight: .medium))
+            Text(tab.host.alias)
+                .font(.caption)
+                .lineLimit(1)
+            Button(action: onClose) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
+            .buttonStyle(.plain)
+            .padding(.leading, 2)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(isSelected ? Color.accentColor.opacity(0.18) : Color.gray.opacity(0.08))
+        .cornerRadius(6)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .padding(.trailing, 2)
+    }
+}
 
-            // — ADVANCED (Other options) — collapsed by default
-            if !host.extraOptions.isEmpty {
-                Section {
-                    DisclosureGroup("Other options (\(host.extraOptions.count))",
-                                     isExpanded: $showAdvanced) {
-                        ForEach(Array(host.extraOptions.enumerated()), id: \.offset) { _, opt in
-                            HStack {
-                                Text(opt.key).font(.system(.caption, design: .monospaced))
-                                Spacer()
-                                Text(opt.value)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
+// MARK: - แถบ splitter ลากปรับขนาด panel
+private struct PanelSplitter: View {
+    @Binding var fraction: CGFloat
+    let totalHeight: CGFloat
+
+    // freeze ค่าเริ่มต้นเมื่อเริ่ม drag — ป้องกัน feedback loop เมื่อ layout resize ระหว่างลาก
+    @State private var dragStart: (fraction: CGFloat, height: CGFloat)? = nil
+    @State private var hovering: Bool = false
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(hovering ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.18))
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onHover { isHover in
+            hovering = isHover
+            if isHover { NSCursor.resizeUpDown.push() }
+            else { NSCursor.pop() }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    // จำค่าแรก ณ เริ่ม gesture — ไม่อัปเดตระหว่างลาก
+                    if dragStart == nil {
+                        dragStart = (fraction, totalHeight)
+                    }
+                    let start = dragStart!
+                    let delta = value.translation.height / max(start.height, 1)
+                    fraction = max(0.15, min(0.85, start.fraction + delta))
+                }
+                .onEnded { _ in dragStart = nil }
+        )
+    }
+}
+
+// MARK: - SFTP Panel (แท็บคงสภาพ)
+private struct SFTPSessionPanel: View {
+    let sessions: [SSHView.SessionTab]
+    @Binding var selectedKey: String?
+    let onClose: (SSHView.SessionTab) -> Void
+    @Binding var sftpSessions: [String: SFTPSession]
+
+    var body: some View {
+        let myTabs = sessions.filter { $0.kind == .sftp }
+        let activeKey: String? = {
+            if let s = selectedKey, myTabs.contains(where: { $0.sessionKey == s }) { return s }
+            return myTabs.last?.sessionKey
+        }()
+        VStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    Text("SFTP")
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .foregroundStyle(.secondary)
+                    ForEach(myTabs, id: \.sessionKey) { tab in
+                        SessionTabButton(
+                            tab: tab,
+                            isSelected: tab.sessionKey == activeKey,
+                            onSelect: { selectedKey = tab.sessionKey },
+                            onClose: { onClose(tab) }
+                        )
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .frame(height: 36)
+            Divider()
+            // ZStack วาด session ทุกตัว — แสดงเฉพาะตัวที่ active ผ่าน opacity
+            // เก็บ ForEach key ด้วย sessionKey เพื่อให้ SwiftUI คง view เดิมไม่ recreate
+            ZStack {
+                if myTabs.isEmpty {
+                    Text("ยังไม่มี SFTP session")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(myTabs, id: \.sessionKey) { tab in
+                        if let session = sftpSessions[tab.sessionKey] {
+                            SFTPBrowserView(session: session)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .opacity(tab.sessionKey == activeKey ? 1 : 0)
+                                .allowsHitTesting(tab.sessionKey == activeKey)
                         }
                     }
                 }
             }
-
-            // — ACTIONS
-            Section {
-                Button {
-                    // commit password ลง Keychain ก่อนเปิด session — กัน timing issue
-                    // ของ onChange ที่อาจยังไม่ทัน save
-                    if !password.isEmpty {
-                        savePassword(password, host)
-                    }
-                    onOpenSession()
-                } label: {
-                    Label("Open Session (Terminal + SFTP)", systemImage: "play.circle.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .controlSize(.large)
-                .disabled(host.alias.trimmingCharacters(in: .whitespaces).isEmpty)
-
-                HStack {
-                    Spacer()
-                    Button(role: .destructive) {
-                        password = ""
-                        forgetCredentials(host)
-                    } label: {
-                        Label("Forget Saved Credentials", systemImage: "trash")
-                            .font(.caption)
-                    }
-                    .controlSize(.small)
-                    .help("ลบ password + passphrase ที่ save ใน Keychain ของ host นี้")
-                }
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .formStyle(.grouped)
-        .frame(minWidth: 380)
-        .onAppear {
-            password = loadPassword(host) ?? ""
-            didLoadPassword = true
-        }
-        .onChange(of: password) { _, newVal in
-            // กัน save ตอน initial load
-            guard didLoadPassword else { return }
-            savePassword(newVal, host)
-        }
-        // ถ้า user/hostname เปลี่ยน → re-key Keychain account ของ password
-        .onChange(of: host.user) { _, _ in resaveIfNeeded() }
-        .onChange(of: host.hostName) { _, _ in resaveIfNeeded() }
-    }
-
-    /// re-save password ลง account ใหม่ (ถ้า user/hostname เปลี่ยน)
-    private func resaveIfNeeded() {
-        guard didLoadPassword, !password.isEmpty else { return }
-        savePassword(password, host)
+        .background(.bar)
     }
 }
 
-#Preview { SSHView() }
+// MARK: - Terminal Panel (แท็บคงสภาพ)
+private struct TerminalSessionPanel: View {
+    let sessions: [SSHView.SessionTab]
+    @Binding var selectedKey: String?
+    let onClose: (SSHView.SessionTab) -> Void
+
+    var body: some View {
+        let myTabs = sessions.filter { $0.kind == .terminal }
+        let activeKey: String? = {
+            if let s = selectedKey, myTabs.contains(where: { $0.sessionKey == s }) { return s }
+            return myTabs.last?.sessionKey
+        }()
+        VStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    Text("Terminal")
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .foregroundStyle(.secondary)
+                    ForEach(myTabs, id: \.sessionKey) { tab in
+                        SessionTabButton(
+                            tab: tab,
+                            isSelected: tab.sessionKey == activeKey,
+                            onSelect: { selectedKey = tab.sessionKey },
+                            onClose: { onClose(tab) }
+                        )
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .frame(height: 36)
+            Divider()
+            ZStack {
+                if myTabs.isEmpty {
+                    Text("ยังไม่มี Terminal session")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(myTabs, id: \.sessionKey) { tab in
+                        SSHTerminalView(host: tab.host, isActive: tab.sessionKey == activeKey)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .opacity(tab.sessionKey == activeKey ? 1 : 0)
+                            .allowsHitTesting(tab.sessionKey == activeKey)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(.bar)
+    }
+}

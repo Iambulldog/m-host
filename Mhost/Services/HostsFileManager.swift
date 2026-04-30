@@ -87,3 +87,19 @@ final class HostsFileManager {
         HostEntry.isValidIPAddress(ip)
     }
 }
+
+extension HostsFileManager {
+    /// หา SSHHost จาก HostEntry (mapping ตาม ip/hostname)
+    func findHost(for entry: HostEntry) -> SSHHost? {
+        // ตัวอย่าง mapping: สมมุติว่า ip = hostName, hostname = alias
+        SSHHost(
+            alias: entry.hostname,
+            hostName: entry.ip,
+            user: "",
+            port: "",
+            identityFile: "",
+            defaultPath: "",
+            extraOptions: []
+        )
+    }
+}

@@ -3,8 +3,7 @@ import Security
 import Network
 
 /// จัดการ certificate สำหรับ MITM ของ proxy
-/// เรียก mkcert สร้าง cert ต่อ host แล้ว import เป็น SecIdentity เพื่อใช้กับ NWProtocolTLS
-/// ใช้ NSLock กัน race เพราะถูกเรียกจาก background IO queue
+/// เรียก mkcert สร้าง cert ต่อ host หรือใช้ cert ที่ระบุมาเอง แล้ว import เป็น SecIdentity เพื่อใช้กับ NWProtocolTLS
 final class ProxyCertManager {
 
     enum CertError: LocalizedError {
@@ -28,9 +27,7 @@ final class ProxyCertManager {
     private let tempDir: URL
     private var identityCache: [String: SecIdentity] = [:]
     private let lock = NSLock()
-    /// password ของ PKCS12 ภายใน — ใช้เพราะ macOS รุ่นใหม่ไม่รับ p12 ที่ password ว่าง
-    /// (errSecAuthFailed/-25293) ค่านี้ไม่มีผลกับใครเพราะไฟล์อยู่ใน temp + import แล้ว
-    /// ก็ลบทิ้ง
+    /// password ของ PKCS12 ภายใน
     private let p12Password = "mhost-mitm"
 
     init() {
@@ -39,42 +36,57 @@ final class ProxyCertManager {
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     }
 
-    /// คืน SecIdentity สำหรับ host (สร้าง cert ผ่าน mkcert ถ้ายังไม่มี cache)
-    func identity(for host: String, mkcertPath: String?) throws -> SecIdentity {
+    /// คืน SecIdentity สำหรับ host
+    /// - Parameters:
+    ///   - host: ชื่อ domain
+    ///   - mkcertPath: path ของ executable mkcert
+    ///   - certPath: (Optional) path ของไฟล์ .pem ที่มีอยู่แล้ว
+    ///   - keyPath: (Optional) path ของไฟล์ key .pem ที่มีอยู่แล้ว
+    func identity(for host: String, mkcertPath: String?, certPath: String? = nil, keyPath: String? = nil) throws -> SecIdentity {
         lock.lock()
         if let cached = identityCache[host] {
             lock.unlock()
             return cached
         }
         lock.unlock()
-        guard let mkcert = mkcertPath else { throw CertError.mkcertNotFound }
 
+        let finalCertPath: String
+        let finalKeyPath: String
         let safe = host
             .replacingOccurrences(of: "*", with: "wildcard")
             .replacingOccurrences(of: "/", with: "_")
-        let certURL = tempDir.appendingPathComponent("\(safe).pem")
-        let keyURL  = tempDir.appendingPathComponent("\(safe)-key.pem")
-        let p12URL  = tempDir.appendingPathComponent("\(safe).p12")
 
-        // 1) สร้าง cert/key ด้วย mkcert (ไม่ต้อง admin — เขียนใน temp)
-        if !FileManager.default.fileExists(atPath: certURL.path) ||
-           !FileManager.default.fileExists(atPath: keyURL.path) {
-            let r = try runProcess(mkcert,
-                arguments: ["-cert-file", certURL.path, "-key-file", keyURL.path, host])
-            if r.exitCode != 0 {
-                throw CertError.mkcertFailed("\(r.stderr)\n\(r.stdout)")
+        // 1) เลือกว่าจะใช้ไฟล์ที่มีอยู่แล้ว หรือจะให้ mkcert สร้างให้ใหม่
+        if let cp = certPath, let kp = keyPath,
+           FileManager.default.fileExists(atPath: cp),
+           FileManager.default.fileExists(atPath: kp) {
+            finalCertPath = cp
+            finalKeyPath = kp
+        } else {
+            guard let mkcert = mkcertPath else { throw CertError.mkcertNotFound }
+            let certURL = tempDir.appendingPathComponent("\(safe).pem")
+            let keyURL  = tempDir.appendingPathComponent("\(safe)-key.pem")
+
+            if !FileManager.default.fileExists(atPath: certURL.path) ||
+               !FileManager.default.fileExists(atPath: keyURL.path) {
+                let r = try runProcess(mkcert,
+                    arguments: ["-cert-file", certURL.path, "-key-file", keyURL.path, host])
+                if r.exitCode != 0 {
+                    throw CertError.mkcertFailed("\(r.stderr)\n\(r.stdout)")
+                }
             }
+            finalCertPath = certURL.path
+            finalKeyPath = keyURL.path
         }
 
-        // 2) แปลง PEM → PKCS12 ด้วย openssl (มากับ macOS แน่นอน)
-        // ใช้ password ไม่ว่าง + macalg sha1 เพื่อ compat กับ SecPKCS12Import
-        // ใน macOS Sequoia/26 (เคย errSecAuthFailed -25293 ตอนใช้ pass ว่าง)
+        // 2) แปลง PEM → PKCS12 ด้วย openssl
+        let p12URL = tempDir.appendingPathComponent("\(safe).p12")
         let openssl = "/usr/bin/openssl"
         let r = try runProcess(openssl, arguments: [
             "pkcs12", "-export",
             "-macalg", "sha1",
-            "-inkey", keyURL.path,
-            "-in", certURL.path,
+            "-inkey", finalKeyPath,
+            "-in", finalCertPath,
             "-out", p12URL.path,
             "-passout", "pass:\(p12Password)",
             "-name", host

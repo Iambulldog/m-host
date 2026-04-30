@@ -23,6 +23,13 @@ struct SSHSessionView: View {
         }
     }
     @State private var tab: Tab = .terminal
+    @StateObject private var sftpSession: SFTPSession
+
+    init(host: SSHHost, onClose: @escaping () -> Void) {
+        self.host = host
+        self.onClose = onClose
+        _sftpSession = StateObject(wrappedValue: SFTPSession(host: host))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -65,7 +72,7 @@ struct SSHSessionView: View {
                 case .terminal:
                     SSHTerminalView(host: host)
                 case .sftp:
-                    SFTPBrowserView(host: host)
+                    SFTPBrowserView(session: sftpSession)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
