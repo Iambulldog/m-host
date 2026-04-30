@@ -21,6 +21,11 @@ struct ContentView: View {
                 .tabItem {
                     Label("mkcert", systemImage: "lock.shield")
                 }
+
+            SSHKeyManagerView()
+                .tabItem {
+                    Label("SSH Keys", systemImage: "key.fill")
+                }
         }
         .frame(minWidth: 720, minHeight: 520)
     }

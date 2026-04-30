@@ -1,13 +1,9 @@
-import Citadel
-import Crypto
+import Combine
 import Foundation
-import NIOCore
-import Observation
 import Security
 
-/// macOS Keychain wrapper สำหรับเก็บ password/passphrase ของ SSH/SFTP
-/// Termius-style: บันทึกครั้งเดียว ครั้งหน้า auto-fill
-/// เก็บใน file นี้รวมเพื่อหลีกเลี่ยงปัญหา Xcode sync group ไม่เห็นไฟล์ใหม่
+// MARK: - KeychainHelper
+
 enum KeychainHelper {
 
     enum Kind: String {
@@ -20,20 +16,20 @@ enum KeychainHelper {
     @discardableResult
     static func save(_ secret: String, kind: Kind, account: String) -> Bool {
         guard let data = secret.data(using: .utf8) else { return false }
-        let baseQuery: [String: Any] = [
+        let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: kind.serviceName,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(baseQuery as CFDictionary)
-        var addQuery = baseQuery
-        addQuery[kSecValueData as String] = data
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        return SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess
+        SecItemDelete(base as CFDictionary)
+        var q = base
+        q[kSecValueData as String] = data
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+        return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
     }
 
     static func load(kind: Kind, account: String) -> String? {
-        let query: [String: Any] = [
+        let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: kind.serviceName,
             kSecAttrAccount as String: account,
@@ -41,20 +37,20 @@ enum KeychainHelper {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
     @discardableResult
     static func delete(kind: Kind, account: String) -> Bool {
-        let query: [String: Any] = [
+        let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: kind.serviceName,
             kSecAttrAccount as String: account
         ]
-        let status = SecItemDelete(query as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
+        let s = SecItemDelete(q as CFDictionary)
+        return s == errSecSuccess || s == errSecItemNotFound
     }
 
     static func deleteAll(forHost host: SSHHost) {
@@ -69,7 +65,8 @@ enum KeychainHelper {
     }
 }
 
-/// แทน entry หนึ่ง row ใน SFTP browser
+// MARK: - SFTPEntry
+
 struct SFTPEntry: Identifiable, Hashable {
     var id: String { name }
     let name: String
@@ -94,11 +91,13 @@ struct SFTPEntry: Identifiable, Hashable {
     }
 }
 
-/// Citadel-based SFTP session per host
-/// ลำดับ auth: ลอง key (จาก IdentityFile หรือ ~/.ssh/id_ed25519) ก่อน ถ้าไม่ได้ → password
-@Observable
+// MARK: - SFTPSession
+
+/// ssh/scp-based SFTP — stateless subprocess per operation
+/// ใช้ ~/.ssh/config + ssh-agent + macOS Keychain ของระบบ
+/// รองรับทุก key type, ProxyJump, ControlMaster, ฯลฯ
 @MainActor
-final class SFTPSession {
+final class SFTPSession: ObservableObject {
 
     enum Status {
         case idle
@@ -107,25 +106,25 @@ final class SFTPSession {
         case failed(String)
     }
 
-    /// อะไรที่ต้องการให้ user ป้อน
     enum Credential: Equatable {
         case none
-        case keyPassphrase  // key มี passphrase
-        case userPassword   // ไม่มี key หรือ key ใช้ไม่ได้ → fallback password
+        case keyPassphrase
+        case userPassword
     }
 
-    var status: Status = .idle
-    var entries: [SFTPEntry] = []
-    var currentPath: String
-    /// ต้องการ credential อะไร (UI ใช้ trigger sheet ที่เหมาะ)
-    var needs: Credential = .none
-    /// alias เก่า — ให้ UI ที่ยังใช้ของเดิมไม่พัง
-    var needsPassword: Bool { needs == .userPassword }
-    var lastError: String?
+    @Published var status: Status = .idle
+    @Published var entries: [SFTPEntry] = []
+    @Published var currentPath: String
+    @Published var needs: Credential = .none
+    @Published var lastError: String?
 
-    private var sshClient: SSHClient?
-    private var sftp: SFTPClient?
+    var needsPassword: Bool { needs == .userPassword }
+    var isConnected: Bool { if case .connected = status { return true }; return false }
+
     let host: SSHHost
+
+    /// password ที่ใช้ connect สำเร็จ (nil = key/agent auth)
+    private var connectedPassword: String? = nil
 
     init(host: SSHHost) {
         self.host = host
@@ -133,258 +132,357 @@ final class SFTPSession {
         self.currentPath = p.isEmpty ? "." : p
     }
 
-    var isConnected: Bool {
-        if case .connected = status { return true }
-        return false
-    }
+    /// kept for API compatibility
+    func cleanupAskpassScript() {}
 
-    /// connect — flow:
-    /// 1. ถ้ามี IdentityFile → ลองโหลด ed25519
-    ///    - ไม่เข้ารหัส → ใช้เลย
-    ///    - เข้ารหัส + ไม่มี passphrase → set `needs = .keyPassphrase` → return
-    ///    - เข้ารหัส + มี passphrase → ใช้ ssh-keygen ถอด
-    /// 2. ถ้า key ใช้ไม่ได้ทั้งหมด + ไม่มี password → set `needs = .userPassword` → return
-    /// 3. มี password → ลอง password auth
+    // MARK: - Connect / Disconnect
+
+    /// 1. ถ้าไม่มี password → BatchMode=yes (key + ssh-agent)
+    /// 2. ถ้ามี password → SSH_ASKPASS
     func connect(passphrase: String? = nil,
                  password: String? = nil,
                  saveToKeychain: Bool = false) async {
+        await disconnect()
         status = .connecting
         lastError = nil
         needs = .none
 
-        let username = host.user.trimmingCharacters(in: .whitespaces).isEmpty
-            ? NSUserName()
-            : host.user
-        let portInt = Int(host.port.trimmingCharacters(in: .whitespaces)) ?? 22
-        let hostName = host.hostName.trimmingCharacters(in: .whitespaces).isEmpty
-            ? host.alias
-            : host.hostName
+        let pwToUse = password ?? KeychainHelper.load(kind: .userPassword, account: host.keychainAccount)
+        let usePassword = !(pwToUse ?? "").isEmpty
 
-        // 1. ลอง key auth
-        var auth: SSHAuthenticationMethod?
-        var usedPassphraseFromUser: String?
-        let keyPath = resolveIdentityFile()
-        if let p = keyPath {
-            do {
-                let isEnc = SSHKeyLoader.isEncrypted(at: p)
-                let phrase: String? = passphrase
-                    ?? (isEnc ? KeychainHelper.load(kind: .keyPassphrase, account: p) : nil)
-                if isEnc && (phrase == nil || phrase?.isEmpty == true) {
-                    needs = .keyPassphrase
-                    status = .idle
-                    return
-                }
-                let key = try SSHKeyLoader.loadKey(at: p, passphrase: phrase)
-                if isEnc, passphrase != nil { usedPassphraseFromUser = phrase }
-                switch key {
-                case .ed25519(let priv):
-                    auth = .ed25519(username: username, privateKey: priv)
-                case .rsa(let priv):
-                    auth = .rsa(username: username, privateKey: priv)
-                }
-            } catch SSHKeyLoader.LoadError.wrongPassphrase {
-                KeychainHelper.delete(kind: .keyPassphrase, account: keyPath ?? "")
-                lastError = "passphrase ไม่ถูก ลองใหม่"
-                needs = .keyPassphrase
-                status = .idle
-                return
-            } catch SSHKeyLoader.LoadError.encryptedKeyNeedsPassphrase {
-                needs = .keyPassphrase
-                status = .idle
-                return
-            } catch {
-                lastError = "key auth: \(error.localizedDescription)"
-            }
-        }
+        var args = sshBaseArgs(usePassword: usePassword)
+        args += [host.alias, "echo mhost-ok"]
 
-        // 2. ถ้าไม่มี key หรือ key ใช้ไม่ได้ ใช้ password
-        var usedPasswordFromUser: String?
-        // ใช้ canonical account key เดียวกับที่ HostEditor ใช้ตอน save
-        let pwAccount = host.keychainAccount
-        if auth == nil {
-            // ลำดับ: argument > Keychain > prompt
-            let pw: String? = password
-                ?? KeychainHelper.load(kind: .userPassword, account: pwAccount)
-            guard let p = pw, !p.isEmpty else {
-                needs = .userPassword
-                status = .idle
-                return
-            }
-            if password != nil { usedPasswordFromUser = p }
-            auth = .passwordBased(username: username, password: p)
-        }
+        let r = await runSSH(args: args, password: usePassword ? pwToUse : nil, timeout: 25)
 
-        // 3. connect
-        do {
-            sshClient = try await SSHClient.connect(
-                host: hostName,
-                port: portInt,
-                authenticationMethod: auth!,
-                hostKeyValidator: .acceptAnything(),
-                reconnect: .never
-            )
-            sftp = try await sshClient?.openSFTP()
+        if r.exit == 0 && r.out.contains("mhost-ok") {
+            connectedPassword = usePassword ? pwToUse : nil
             status = .connected
-            await loadDirectory(currentPath)
-
-            // 4. บันทึก credential ที่ user เพิ่งใส่ (ถ้าเลือก save) ลง Keychain
-            if saveToKeychain {
-                if let ph = usedPassphraseFromUser, let kp = keyPath {
-                    KeychainHelper.save(ph, kind: .keyPassphrase, account: kp)
-                }
-                if let pw = usedPasswordFromUser {
-                    KeychainHelper.save(pw, kind: .userPassword, account: pwAccount)
-                }
+            if saveToKeychain, let pw = password, !pw.isEmpty {
+                KeychainHelper.save(pw, kind: .userPassword, account: host.keychainAccount)
             }
-        } catch {
-            // ถ้า fail (อาจเพราะ password ผิดที่มาจาก Keychain) — ลบของเก่าทิ้ง
-            if password == nil, usedPasswordFromUser == nil {
-                KeychainHelper.delete(kind: .userPassword, account: pwAccount)
-            }
-            let raw = "\(type(of: error)).\(error)"
-            // friendly message
-            let lower = raw.lowercased()
-            if lower.contains("allauthentication") || lower.contains("authenticationfailed")
-                || lower.contains("password") {
-                let detail = """
-                Server ปฏิเสธ password auth — server น่าจะตั้ง 'PasswordAuthentication no'
-                ต้องใช้ key auth (V1 รองรับเฉพาะ ed25519 ไม่มี passphrase)
-
-                แนะนำ: สร้าง ed25519 key ใหม่ + เพิ่มเข้า authorized_keys ของ server แล้ว
-                ตั้ง SSH Key ใน Mhost ให้ชี้ key นั้น
-                """
-                status = .failed(detail)
-                lastError = detail
-            } else {
-                status = .failed(raw)
-                lastError = raw
-            }
+            let initial = host.defaultPath.trimmingCharacters(in: .whitespaces)
+            await loadDirectory(initial.isEmpty ? "." : initial)
+        } else {
+            await classifyError(r.err + "\n" + r.out,
+                                triedPassword: usePassword,
+                                hadPasswordFromUser: password != nil)
         }
     }
 
     func disconnect() async {
-        if let s = sftp { try? await s.close() }
-        if let c = sshClient { try? await c.close() }
-        sftp = nil
-        sshClient = nil
+        connectedPassword = nil
         status = .idle
         entries = []
+        lastError = nil
     }
 
-    /// list directory
+    // MARK: - Directory operations
+
+    /// ssh alias "cd path && pwd && ls -la --time-style='+%Y-%m-%d %H:%M:%S'"
     func loadDirectory(_ path: String) async {
-        guard let sftp else { return }
-        do {
-            let messages = try await sftp.listDirectory(atPath: path)
-            // แต่ละ SFTPMessage.Name มี components — flatMap
-            let allComponents = messages.flatMap { $0.components }
-            entries = allComponents.compactMap { c -> SFTPEntry? in
-                let name = c.filename
-                if name == "." { return nil }
-                // Citadel เก็บ permissions เป็น UInt32 (Unix mode bits) — เช็ค type bits เอง
-                // S_IFMT = 0o170000, S_IFDIR = 0o040000, S_IFLNK = 0o120000
-                let mode: UInt32 = c.attributes.permissions ?? 0
-                let typeBits = mode & 0o170000
-                let isDir = typeBits == 0o040000
-                let isLink = typeBits == 0o120000
-                let size = c.attributes.size ?? 0
-                // Citadel เก็บ time ไว้ใน nested struct accessModificationTime
-                let mtime = c.attributes.accessModificationTime?.modificationTime
-                return SFTPEntry(
-                    name: name,
-                    isDirectory: isDir,
-                    isSymlink: isLink,
-                    size: size,
-                    modificationTime: mtime
-                )
-            }
-            // เรียง: dir ก่อน, แล้วตามชื่อ
-            .sorted { (a, b) in
-                if a.isDirectory != b.isDirectory { return a.isDirectory }
-                return a.name.lowercased() < b.name.lowercased()
-            }
-            currentPath = path
-            lastError = nil
-        } catch {
-            lastError = "list failed: \(error.localizedDescription)"
+        guard isConnected else { return }
+
+        let escaped = shellEscape(path)
+        let cmd = "cd \(escaped) && pwd && ls -la --time-style='+%Y-%m-%d %H:%M:%S'"
+        var args = sshBaseArgs(usePassword: connectedPassword != nil)
+        args += [host.alias, cmd]
+
+        let r = await runSSH(args: args, password: connectedPassword, timeout: 30)
+
+        if r.exit != 0 {
+            lastError = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+            return
         }
+
+        var lines = r.out.components(separatedBy: "\n")
+        guard !lines.isEmpty else { return }
+
+        // first line = pwd output
+        let pwd = lines.removeFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var newEntries: [SFTPEntry] = []
+        for line in lines {
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty, !t.hasPrefix("total ") else { continue }
+            if let e = parseLsLine(t) { newEntries.append(e) }
+        }
+
+        currentPath = pwd.isEmpty ? path : pwd
+        entries = newEntries.sorted {
+            if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
+            return $0.name.lowercased() < $1.name.lowercased()
+        }
+        lastError = nil
     }
 
-    /// double-click folder
     func enter(_ entry: SFTPEntry) async {
         guard entry.isDirectory else { return }
         let next: String
         if entry.name == ".." {
             next = parentPath(currentPath)
-        } else if currentPath.hasSuffix("/") {
-            next = currentPath + entry.name
         } else {
-            next = currentPath + "/" + entry.name
+            next = currentPath.hasSuffix("/") ? currentPath + entry.name : currentPath + "/" + entry.name
         }
         await loadDirectory(next)
     }
 
-    /// breadcrumb up
-    func goUp() async {
-        await loadDirectory(parentPath(currentPath))
-    }
+    func goUp() async { await loadDirectory(parentPath(currentPath)) }
 
-    /// path เต็มของ entry ในโฟลเดอร์ปัจจุบัน
     func remotePath(of entry: SFTPEntry) -> String {
-        if currentPath.hasSuffix("/") {
-            return currentPath + entry.name
-        }
-        return currentPath + "/" + entry.name
+        currentPath.hasSuffix("/") ? currentPath + entry.name : currentPath + "/" + entry.name
     }
 
-    /// download ไฟล์จาก remote → save ลง local URL
-    /// คืน success/error
+    // MARK: - Upload (scp)
+
+    func upload(localURL: URL, to remotePath: String) async -> Result<Void, Error> {
+        guard isConnected else { return .failure(err("ยังไม่ได้ connect", code: 1)) }
+        let dst = "\(host.alias):\(remotePath)"
+        var args: [String] = ["-p", "-o", "StrictHostKeyChecking=accept-new"]
+        if connectedPassword != nil {
+            args += [
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "NumberOfPasswordPrompts=1"
+            ]
+        } else {
+            args += ["-o", "BatchMode=yes"]
+        }
+        args += [localURL.path, dst]
+        let r = await runProcess("/usr/bin/scp", args: args, password: connectedPassword, timeout: 300)
+        if r.exit == 0 { return .success(()) }
+        let msg = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .failure(err(msg.isEmpty ? "upload ไม่สำเร็จ" : msg, code: 3))
+    }
+
+    // MARK: - Download (scp)
+
     func download(_ entry: SFTPEntry, to localURL: URL) async -> Result<Void, Error> {
-        guard let sftp else {
-            return .failure(NSError(domain: "Mhost.SFTP", code: 1,
-                                    userInfo: [NSLocalizedDescriptionKey: "ยังไม่ได้ connect"]))
+        guard isConnected else {
+            return .failure(err("ยังไม่ได้ connect", code: 1))
         }
-        let remote = remotePath(of: entry)
-        do {
-            // อ่านทั้งไฟล์เป็น ByteBuffer แล้ว write ลง URL
-            // (Citadel: sftp.withFile(filePath:flags:) → callback คืน file handle)
-            let buffer = try await sftp.withFile(filePath: remote, flags: .read) { file in
-                try await file.readAll()
-            }
-            // ByteBuffer → Data (ใช้ readableBytesView เพื่อเลี่ยง dependency NIOFoundationCompat)
-            let data = Data(buffer.readableBytesView)
-            try data.write(to: localURL, options: .atomic)
+        let src = "\(host.alias):\(remotePath(of: entry))"
+        var args: [String] = ["-p", "-o", "StrictHostKeyChecking=accept-new"]
+        if connectedPassword != nil {
+            args += [
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "NumberOfPasswordPrompts=1"
+            ]
+        } else {
+            args += ["-o", "BatchMode=yes"]
+        }
+        args += [src, localURL.path]
+
+        let r = await runProcess("/usr/bin/scp", args: args, password: connectedPassword, timeout: 300)
+
+        if r.exit == 0 && FileManager.default.fileExists(atPath: localURL.path) {
             return .success(())
-        } catch {
-            return .failure(error)
         }
+        let msg = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .failure(err(msg.isEmpty ? "download ไม่สำเร็จ" : msg, code: 2))
+    }
+
+    // MARK: - Error classification
+
+    private func classifyError(_ raw: String, triedPassword: Bool, hadPasswordFromUser: Bool) async {
+        let lower = raw.lowercased()
+        if lower.contains("permission denied") || lower.contains("authentication failed")
+            || lower.contains("no supported authentication methods") {
+            if triedPassword && !hadPasswordFromUser {
+                KeychainHelper.delete(kind: .userPassword, account: host.keychainAccount)
+            }
+            lastError = triedPassword
+                ? "password ไม่ถูก หรือ server ปฏิเสธ"
+                : "key auth ไม่ผ่าน — กรอก password ของ \(host.user.isEmpty ? "user" : host.user)"
+            needs = .userPassword
+            status = .idle
+        } else if lower.contains("could not resolve hostname") {
+            setFailed("DNS resolve ไม่ได้: \(host.hostName.isEmpty ? host.alias : host.hostName)")
+        } else if lower.contains("connection refused") {
+            setFailed("connection refused — port อาจปิด")
+        } else if lower.contains("connection timed out") || lower.contains("timed out") {
+            setFailed("connection timeout")
+        } else if lower.contains("host key verification failed") {
+            setFailed("Host key ไม่ตรง — ตรวจ ~/.ssh/known_hosts")
+        } else {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            setFailed(trimmed.isEmpty ? "เชื่อมต่อไม่สำเร็จ" : trimmed)
+        }
+    }
+
+    private func setFailed(_ msg: String) {
+        status = .failed(msg)
+        lastError = msg
+    }
+
+    // MARK: - SSH arg builders
+
+    private func sshBaseArgs(usePassword: Bool) -> [String] {
+        var a: [String] = [
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3"
+        ]
+        if usePassword {
+            a += [
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "NumberOfPasswordPrompts=1"
+            ]
+        } else {
+            a += [
+                "-o", "BatchMode=yes",
+                "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no"
+            ]
+        }
+        return a
+    }
+
+    private func runSSH(args: [String], password: String?, timeout: TimeInterval) async
+        -> (exit: Int32, out: String, err: String)
+    {
+        await runProcess("/usr/bin/ssh", args: args, password: password, timeout: timeout)
+    }
+
+    // MARK: - Async process runner
+
+    /// spawn subprocess — non-blocking via terminationHandler + withCheckedContinuation
+    private func runProcess(
+        _ exec: String,
+        args: [String],
+        password: String?,
+        timeout: TimeInterval
+    ) async -> (exit: Int32, out: String, err: String) {
+        var env = ProcessInfo.processInfo.environment
+        env["TERM"] = "dumb"
+
+        let askpassURL: URL? = password.map { pw in
+            let url = Self.makeAskpassScript(password: pw)
+            env["SSH_ASKPASS"] = url.path
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = env["DISPLAY"] ?? ":0"
+            return url
+        }
+
+        return await withCheckedContinuation { cont in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: exec)
+            proc.arguments = args
+            proc.environment = env
+            proc.standardInput = FileHandle.nullDevice
+
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
+
+            // guard against double-resume
+            final class Once: @unchecked Sendable {
+                private let lock = NSLock()
+                private var fired = false
+                func call(_ body: () -> Void) {
+                    lock.lock(); defer { lock.unlock() }
+                    guard !fired else { return }
+                    fired = true
+                    body()
+                }
+            }
+            let once = Once()
+            let finish: @Sendable (Int32, String, String) -> Void = { r0, r1, r2 in
+                once.call {
+                    if let u = askpassURL { try? FileManager.default.removeItem(at: u) }
+                    cont.resume(returning: (r0, r1, r2))
+                }
+            }
+
+            // timeout watchdog
+            let watchdog = DispatchWorkItem {
+                if proc.isRunning { proc.terminate() }
+                finish(-1, "", "timeout (\(Int(timeout))s)")
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+
+            proc.terminationHandler = { p in
+                watchdog.cancel()
+                // safe to read after process exits — pipes have EOF
+                let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                finish(p.terminationStatus, out, err)
+            }
+
+            do {
+                try proc.run()
+            } catch {
+                watchdog.cancel()
+                finish(-1, "", "เรียก \(exec) ไม่ได้: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // MARK: - Parsing
+
+    /// ls -la --time-style='+%Y-%m-%d %H:%M:%S' format:
+    /// "drwxr-xr-x 5 user group 4096 2024-01-15 10:30:00 dirname"
+    /// parts: [0]perms [1]nlinks [2]user [3]group [4]size [5]date [6]time [7...]name
+    private func parseLsLine(_ line: String) -> SFTPEntry? {
+        guard line.count >= 10 else { return nil }
+        let mode = line.prefix(10)
+        guard let type = mode.first else { return nil }
+        let isDir = type == "d", isLink = type == "l"
+        guard type == "-" || isDir || isLink else { return nil }
+        guard mode.dropFirst().allSatisfy({ "rwxstST-".contains($0) }) else { return nil }
+
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard parts.count >= 8 else { return nil }
+
+        let size = UInt64(parts[4]) ?? 0
+
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let modDate = df.date(from: "\(parts[5]) \(parts[6])")
+
+        let nameRaw = parts[7...].joined(separator: " ")
+        let name: String
+        if isLink, let arrow = nameRaw.range(of: " -> ") {
+            name = String(nameRaw[..<arrow.lowerBound])
+        } else {
+            name = nameRaw
+        }
+        guard name != "." else { return nil }
+
+        return SFTPEntry(name: name, isDirectory: isDir, isSymlink: isLink,
+                         size: size, modificationTime: modDate)
+    }
+
+    // MARK: - Utilities
+
+    private func shellEscape(_ path: String) -> String {
+        "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     private func parentPath(_ p: String) -> String {
-        if p == "/" || p.isEmpty || p == "." { return "/" }
-        let trimmed = p.hasSuffix("/") ? String(p.dropLast()) : p
-        let parent = (trimmed as NSString).deletingLastPathComponent
+        guard p != "/" && !p.isEmpty && p != "." else { return "/" }
+        let t = p.hasSuffix("/") ? String(p.dropLast()) : p
+        let parent = (t as NSString).deletingLastPathComponent
         return parent.isEmpty ? "/" : parent
     }
 
-    // MARK: - Identity file resolution
+    private func err(_ msg: String, code: Int) -> NSError {
+        NSError(domain: "Mhost.SFTP", code: code,
+                userInfo: [NSLocalizedDescriptionKey: msg])
+    }
 
-    /// คืน path ของ IdentityFile ถ้ามี
-    /// 1. ใช้ host.identityFile ถ้าผู้ใช้ตั้งไว้
-    /// 2. fallback ไป ~/.ssh/id_ed25519 ถ้าไฟล์มีอยู่
-    private func resolveIdentityFile() -> String? {
-        let trimmed = host.identityFile.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty {
-            let expanded = (trimmed as NSString).expandingTildeInPath
-            if FileManager.default.fileExists(atPath: expanded) {
-                return expanded
-            }
-        }
-        // fallback default
-        let defaultEd = (NSHomeDirectory() as NSString).appendingPathComponent(".ssh/id_ed25519")
-        if FileManager.default.fileExists(atPath: defaultEd) {
-            return defaultEd
-        }
-        return nil
+    private static func makeAskpassScript(password: String) -> URL {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mhost-askpass-\(UUID().uuidString).sh")
+        let safe = password.replacingOccurrences(of: "'", with: "'\\''")
+        try? "#!/bin/sh\nprintf '%s\\n' '\(safe)'\n"
+            .write(to: tmp, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: tmp.path)
+        return tmp
     }
 }
