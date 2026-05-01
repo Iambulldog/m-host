@@ -8,9 +8,6 @@ struct HostsManagerView: View {
     @State private var lastSuccessMessage: String = ""
     @State private var showSuccessBanner: Bool = false
 
-    let onOpenTerminal: ((SSHHost) -> Void)? = nil
-    let onOpenSFTP: ((SSHHost) -> Void)? = nil
-
     private var filteredEntries: [HostEntry] {
         let hostEntries = manager.entries.filter { !$0.isComment }
         if searchText.isEmpty { return hostEntries }
@@ -29,12 +26,12 @@ struct HostsManagerView: View {
             entryList
             errorBar
         }
-        .padding()
         .onAppear { manager.loadEntries() }
-        .onChange(of: manager.errorMessage) { _, newValue in
-            if newValue == nil {
-                lastSuccessMessage = "Hosts file saved successfully."
+        .onChange(of: manager.successMessage) { _, newValue in
+            if let newValue, !newValue.isEmpty {
+                lastSuccessMessage = newValue
                 showSuccessBanner = true
+                manager.successMessage = nil
             }
         }
         .sheet(isPresented: $showAddSheet) {
@@ -90,6 +87,12 @@ struct HostsManagerView: View {
             Button(action: { manager.loadEntries() }) {
                 Label("Reload", systemImage: "arrow.clockwise")
             }
+            Button(action: {
+                showSuccessBanner = false
+                manager.refreshDNSCache()
+            }) {
+                Label("Refresh DNS Cache", systemImage: "arrow.clockwise.circle")
+            }
             Button(action: { showAddSheet = true }) {
                 Label("Add Entry", systemImage: "plus")
             }
@@ -114,6 +117,7 @@ struct HostsManagerView: View {
         .padding(8)
         .background(.quaternary)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal)
         .padding(.bottom, 8)
     }
 
@@ -127,8 +131,18 @@ struct HostsManagerView: View {
                 Label("Redo", systemImage: "arrow.uturn.forward")
             }
             .disabled(!manager.canRedo)
+            if searchText.isEmpty {
+                Text("Drag and hold a row to reorder entries")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Clear search to reorder entries")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
         }
+        .padding(.horizontal)
         .padding(.vertical, 4)
     }
 
@@ -145,23 +159,29 @@ struct HostsManagerView: View {
                 ForEach(filteredEntries) { entry in
                     HostEntryRow(
                         entry: entry,
-                        onToggle: { manager.toggleEntry(entry) },
-                        onDelete: { entryToDelete = entry },
-                        onOpenTerminal: {
-                            if let host = manager.findHost(for: entry) {
-                                onOpenTerminal?(host)
-                            }
+                        canReorder: searchText.isEmpty,
+                        onToggle: {
+                            showSuccessBanner = false
+                            manager.toggleEntry(entry)
                         },
-                        onOpenSFTP: {
-                            if let host = manager.findHost(for: entry) {
-                                onOpenSFTP?(host)
-                            }
+                        onDelete: { entryToDelete = entry },
+                        onSave: { ip, hostname, comment in
+                            showSuccessBanner = false
+                            return manager.updateEntry(id: entry.id, ip: ip, hostname: hostname, comment: comment)
                         }
                     )
+                    .moveDisabled(!searchText.isEmpty)
                 }
+                .onMove(perform: moveEntries)
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
         }
+    }
+
+    private func moveEntries(from offsets: IndexSet, to destination: Int) {
+        guard searchText.isEmpty else { return }
+        showSuccessBanner = false
+        manager.moveHostEntries(fromOffsets: offsets, toOffset: destination)
     }
 
     @ViewBuilder
@@ -185,42 +205,75 @@ struct HostsManagerView: View {
 
 struct HostEntryRow: View {
     let entry: HostEntry
+    let canReorder: Bool
     let onToggle: () -> Void
     let onDelete: () -> Void
-    let onOpenTerminal: (() -> Void)?
-    let onOpenSFTP: (() -> Void)?
+    let onSave: (String, String, String?) -> Bool
 
-    @State private var isHovering = false
+    @State private var ip: String
+    @State private var hostname: String
+    @State private var comment: String
+    @State private var validationMessage: String?
+    @FocusState private var focusedField: Field?
+
+    private enum Field: Hashable {
+        case ip
+        case hostname
+        case comment
+    }
+
+    init(
+        entry: HostEntry,
+        canReorder: Bool,
+        onToggle: @escaping () -> Void,
+        onDelete: @escaping () -> Void,
+        onSave: @escaping (String, String, String?) -> Bool
+    ) {
+        self.entry = entry
+        self.canReorder = canReorder
+        self.onToggle = onToggle
+        self.onDelete = onDelete
+        self.onSave = onSave
+        _ip = State(initialValue: entry.ip)
+        _hostname = State(initialValue: entry.hostname)
+        _comment = State(initialValue: entry.comment ?? "")
+    }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Circle()
-                .fill(entry.isEnabled ? .green : .gray)
-                .frame(width: 8, height: 8)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Image(systemName: canReorder ? "line.3.horizontal" : "line.3.horizontal.decrease")
+                    .foregroundStyle(canReorder ? .secondary : .tertiary)
+                    .help(canReorder ? "Click and hold to reorder" : "Clear search to reorder")
 
-            Text(entry.ip)
-                .font(.system(.body, design: .monospaced))
-                .frame(minWidth: 140, alignment: .leading)
-
-            Text(entry.hostname)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(entry.isEnabled ? .primary : .secondary)
-
-            if let comment = entry.comment, !comment.isEmpty {
-                Text("# \(comment)")
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-            }
-
-            Spacer()
-
-            if isHovering {
                 Button(action: onToggle) {
-                    Image(systemName: entry.isEnabled ? "eye.slash" : "eye")
-                        .foregroundStyle(.secondary)
+                    Image(systemName: entry.isEnabled ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(entry.isEnabled ? .green : .secondary)
                 }
                 .buttonStyle(.plain)
-                .help(entry.isEnabled ? "Disable" : "Enable")
+                .help(entry.isEnabled ? "Disable entry" : "Enable entry")
+
+                TextField("IP Address", text: $ip)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minWidth: 140, maxWidth: 170)
+                    .focused($focusedField, equals: .ip)
+                    .onSubmit(commitEdits)
+
+                TextField("Hostname", text: $hostname)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .focused($focusedField, equals: .hostname)
+                    .onSubmit(commitEdits)
+
+                TextField("Comment (optional)", text: $comment)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minWidth: 180)
+                    .focused($focusedField, equals: .comment)
+                    .onSubmit(commitEdits)
+
+                Spacer(minLength: 8)
 
                 Button(action: onDelete) {
                     Image(systemName: "trash")
@@ -229,26 +282,61 @@ struct HostEntryRow: View {
                 .buttonStyle(.plain)
                 .help("Delete")
             }
+
+            if let validationMessage {
+                Text(validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.leading, 68)
+            }
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
-        .onHover { isHovering = $0 }
-        .contextMenu {
-            if let onOpenTerminal {
-                Button {
-                    onOpenTerminal()
-                } label: {
-                    Label("Open Terminal", systemImage: "terminal")
-                }
-            }
-            if let onOpenSFTP {
-                Button {
-                    onOpenSFTP()
-                } label: {
-                    Label("Open SFTP", systemImage: "folder")
-                }
+        .opacity(entry.isEnabled ? 1 : 0.72)
+        .onChange(of: focusedField) { oldValue, newValue in
+            if oldValue != nil, newValue == nil {
+                commitEdits()
             }
         }
+        .onChange(of: entry) { _, newValue in
+            if focusedField == nil {
+                syncDraft(with: newValue)
+            }
+        }
+    }
+
+    private func commitEdits() {
+        let trimmedIP = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedHostname = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedComment = comment.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedIP.isEmpty else {
+            validationMessage = "IP address is required."
+            return
+        }
+        guard HostsFileManager.validateIP(trimmedIP) else {
+            validationMessage = "Invalid IP address (IPv4 or IPv6)"
+            return
+        }
+        guard !trimmedHostname.isEmpty else {
+            validationMessage = "Hostname is required."
+            return
+        }
+
+        let didSave = onSave(trimmedIP, trimmedHostname, trimmedComment.isEmpty ? nil : trimmedComment)
+        guard didSave else { return }
+
+        ip = trimmedIP
+        hostname = trimmedHostname
+        comment = trimmedComment
+        validationMessage = nil
+    }
+
+    private func syncDraft(with entry: HostEntry) {
+        ip = entry.ip
+        hostname = entry.hostname
+        comment = entry.comment ?? ""
+        validationMessage = nil
     }
 }
 

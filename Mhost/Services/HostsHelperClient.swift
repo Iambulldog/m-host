@@ -4,13 +4,29 @@ import Foundation
 /// ใช้ PrivilegedSession (persistent root shell) — ขอรหัส admin แค่ครั้งเดียวต่อการเปิดแอป
 final class HostsHelperClient {
 
+    private let dnsRefreshCommand = "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder"
+
     /// เขียนทับไฟล์ /etc/hosts (ขอรหัส admin ครั้งแรก, ครั้งถัดไปเงียบ)
     func replaceHostsFile(content: String, completion: @escaping (Bool, String?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 try PrivilegedSession.shared.writeFile(content: content, to: "/etc/hosts")
                 // flush DNS cache (best-effort, ไม่กระทบผลลัพธ์ถ้า fail)
-                _ = try? PrivilegedSession.shared.runAsRoot("/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder")
+                _ = try? PrivilegedSession.shared.runAsRoot(self.dnsRefreshCommand)
+                DispatchQueue.main.async { completion(true, nil) }
+            } catch PrivilegedSession.RunnerError.userCancelled {
+                DispatchQueue.main.async { completion(false, "ผู้ใช้ยกเลิกการให้สิทธิ์") }
+            } catch {
+                DispatchQueue.main.async { completion(false, error.localizedDescription) }
+            }
+        }
+    }
+
+    /// รีเฟรช DNS cache แบบ manual จาก UI
+    func refreshDNSCache(completion: @escaping (Bool, String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                _ = try PrivilegedSession.shared.runAsRoot(self.dnsRefreshCommand)
                 DispatchQueue.main.async { completion(true, nil) }
             } catch PrivilegedSession.RunnerError.userCancelled {
                 DispatchQueue.main.async { completion(false, "ผู้ใช้ยกเลิกการให้สิทธิ์") }
