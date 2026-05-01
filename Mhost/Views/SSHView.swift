@@ -30,6 +30,8 @@ struct SSHView: View {
     @State private var sftpFraction: CGFloat = 0.5
     @State private var sessionStates: [String: SessionState] = [:]
     @State private var sftpSessions: [String: SFTPSession] = [:] // เพิ่มสำหรับคง session SFTP
+    @State private var terminalPasswordCache: [String: String] = [:]
+    @State private var terminalPasswordLoadedAccounts: Set<String> = []
     @State private var searchText: String = ""
 
     var body: some View {
@@ -45,6 +47,8 @@ struct SSHView: View {
                 selectedSFTPKey: $selectedSFTPKey,
                 sftpFraction: $sftpFraction,
                 sftpSessions: $sftpSessions,
+                terminalPasswordCache: $terminalPasswordCache,
+                terminalPasswordLoadedAccounts: $terminalPasswordLoadedAccounts,
                 searchText: $searchText
             )
         }
@@ -66,6 +70,8 @@ private struct SSHViewLayout: View {
     @State private var highlightedIndex: Int? = nil
     @FocusState private var listFocused: Bool
     @Binding var sftpSessions: [String: SFTPSession]
+    @Binding var terminalPasswordCache: [String: String]
+    @Binding var terminalPasswordLoadedAccounts: Set<String>
     @Binding var searchText: String
 
     private var filteredHosts: [SSHHost] {
@@ -262,7 +268,8 @@ private struct SSHViewLayout: View {
                         TerminalSessionPanel(
                             sessions: sessions,
                             selectedKey: $selectedTerminalKey,
-                            onClose: closeSession
+                            onClose: closeSession,
+                            terminalPasswordCache: terminalPasswordCache
                         )
                         .frame(maxHeight: .infinity)
                         .clipped()
@@ -293,11 +300,30 @@ private struct SSHViewLayout: View {
                                 // เขียน ssh config ลงดิสก์
                                 manager.save()
                                 // เก็บ/ลบ password ใน Keychain
-                                manager.savePassword(pw, for: editing)
+                                if let pw {
+                                    manager.savePassword(pw, for: editing)
+                                    let account = editing.keychainAccount
+                                    terminalPasswordLoadedAccounts.insert(account)
+                                    if pw.isEmpty {
+                                        terminalPasswordCache.removeValue(forKey: account)
+                                    } else {
+                                        terminalPasswordCache[account] = pw
+                                    }
+                                }
                             },
-                            loadPassword: { host in manager.savedPassword(for: host) },
-                            savePassword: { pw, host in manager.savePassword(pw, for: host) },
-                            forgetCredentials: { host in manager.forgetCredentials(for: host) }
+                            loadPassword: { host in terminalPasswordCache[host.keychainAccount] },
+                            savePassword: { pw, host in
+                                manager.savePassword(pw, for: host)
+                                let account = host.keychainAccount
+                                terminalPasswordLoadedAccounts.insert(account)
+                                if pw.isEmpty { terminalPasswordCache.removeValue(forKey: account) }
+                                else { terminalPasswordCache[account] = pw }
+                            },
+                            forgetCredentials: { host in
+                                manager.forgetCredentials(for: host)
+                                terminalPasswordLoadedAccounts.insert(host.keychainAccount)
+                                terminalPasswordCache.removeValue(forKey: host.keychainAccount)
+                            }
                         )
                     }
                     .frame(width: rightbarWidth)
@@ -319,20 +345,33 @@ private struct SSHViewLayout: View {
     // MARK: - Session Tab Logic
     private func openSession(for host: SSHHost, kind: SSHView.SessionTab.Kind) {
         let key = "\(host.id.uuidString)-\(kind == .terminal ? "t" : "s")"
-        if !sessions.contains(where: { $0.sessionKey == key }) {
+        if let existingIndex = sessions.firstIndex(where: { $0.sessionKey == key }) {
+            // host ในแท็บเป็น snapshot; อัปเดตทุกครั้งเพื่อให้ defaultPath/HostName/User ล่าสุดถูกใช้
+            sessions[existingIndex] = SSHView.SessionTab(host: host, kind: kind)
+        } else {
             sessions.append(SSHView.SessionTab(host: host, kind: kind))
+        }
+        if kind == .terminal {
+            loadTerminalPasswordIfNeeded(for: host)
         }
         if kind == .sftp {
             let needsNew: Bool
             if let existing = sftpSessions[key] {
-                switch existing.status {
-                case .connecting, .connected: needsNew = false
-                case .idle, .failed: needsNew = true
+                if existing.host != host {
+                    needsNew = true
+                } else {
+                    switch existing.status {
+                    case .connecting, .connected: needsNew = false
+                    case .idle, .failed: needsNew = true
+                    }
                 }
             } else {
                 needsNew = true
             }
             if needsNew {
+                if let existing = sftpSessions[key] {
+                    Task { await existing.disconnect() }
+                }
                 sftpSessions[key] = SFTPSession(host: host)
             }
         }
@@ -346,10 +385,24 @@ private struct SSHViewLayout: View {
 
     private func closeSession(_ tab: SSHView.SessionTab) {
         sessions.removeAll { $0.sessionKey == tab.sessionKey }
+        if tab.kind == .sftp, let existing = sftpSessions.removeValue(forKey: tab.sessionKey) {
+            Task { await existing.disconnect() }
+        }
         if tab.kind == .terminal, selectedTerminalKey == tab.sessionKey {
             selectedTerminalKey = sessions.last(where: { $0.kind == .terminal })?.sessionKey
         } else if tab.kind == .sftp, selectedSFTPKey == tab.sessionKey {
             selectedSFTPKey = sessions.last(where: { $0.kind == .sftp })?.sessionKey
+        }
+    }
+
+    private func loadTerminalPasswordIfNeeded(for host: SSHHost) {
+        let account = host.keychainAccount
+        guard !terminalPasswordLoadedAccounts.contains(account) else { return }
+        terminalPasswordLoadedAccounts.insert(account)
+        if let password = manager.savedPassword(for: host), !password.isEmpty {
+            terminalPasswordCache[account] = password
+        } else {
+            terminalPasswordCache.removeValue(forKey: account)
         }
     }
 }
@@ -359,7 +412,7 @@ private struct HostEditor: View {
     @Binding var host: SSHHost
     var onPickIdentity: () -> String?
     /// บันทึก host เข้า ssh config + เก็บ password ลง Keychain
-    var onSave: (_ password: String) -> Void
+    var onSave: (_ password: String?) -> Void
     /// load password ที่ save ใน Keychain (ถ้ามี)
     var loadPassword: (SSHHost) -> String?
     /// save password ลง Keychain (ถ้าว่างจะลบ)
@@ -372,6 +425,7 @@ private struct HostEditor: View {
     @State private var didLoadPassword: Bool = false
     @State private var showAdvanced: Bool = false
     @State private var saveFlash: Bool = false
+    @State private var passwordEdited: Bool = false
 
     @ViewBuilder
     private func sectionHeader(_ title: String) -> some View {
@@ -437,6 +491,9 @@ private struct HostEditor: View {
                         }
                         .textFieldStyle(.roundedBorder)
                         .labelsHidden()
+                        .onChange(of: password) { _, _ in
+                            passwordEdited = true
+                        }
                         Button {
                             showPassword.toggle()
                         } label: {
@@ -521,7 +578,7 @@ private struct HostEditor: View {
                     .tint(.red)
 
                     Button(action: {
-                        onSave(password)
+                         onSave(passwordEdited ? password : nil)
                         // flash icon เพื่อ feedback ว่ากดสำเร็จ
                         saveFlash = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
@@ -549,6 +606,7 @@ private struct HostEditor: View {
                 DispatchQueue.main.async {
                     if let pw = loadPassword(host) {
                         password = pw
+                         passwordEdited = false
                     }
                 }
             }
@@ -720,6 +778,7 @@ private struct SFTPSessionPanel: View {
                     ForEach(myTabs, id: \.sessionKey) { tab in
                         if let session = sftpSessions[tab.sessionKey] {
                             SFTPBrowserView(session: session)
+                                .id(ObjectIdentifier(session))
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .opacity(tab.sessionKey == activeKey ? 1 : 0)
                                 .allowsHitTesting(tab.sessionKey == activeKey)
@@ -738,6 +797,7 @@ private struct TerminalSessionPanel: View {
     let sessions: [SSHView.SessionTab]
     @Binding var selectedKey: String?
     let onClose: (SSHView.SessionTab) -> Void
+    let terminalPasswordCache: [String: String]
 
     var body: some View {
         let myTabs = sessions.filter { $0.kind == .terminal }
@@ -772,7 +832,11 @@ private struct TerminalSessionPanel: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(myTabs, id: \.sessionKey) { tab in
-                        SSHTerminalView(host: tab.host, isActive: tab.sessionKey == activeKey)
+                         SSHTerminalView(
+                             host: tab.host,
+                             isActive: tab.sessionKey == activeKey,
+                             password: terminalPasswordCache[tab.host.keychainAccount]
+                         )
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .opacity(tab.sessionKey == activeKey ? 1 : 0)
                             .allowsHitTesting(tab.sessionKey == activeKey)

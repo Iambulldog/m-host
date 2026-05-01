@@ -461,7 +461,12 @@ final class SFTPSession: ObservableObject {
     // MARK: - Utilities
 
     private func shellEscape(_ path: String) -> String {
-        "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
+        if path == "~" { return "~" }
+        if path.hasPrefix("~/") {
+            let rest = String(path.dropFirst(2))
+            return "~/\(shellEscape(rest))"
+        }
+        return "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     private func parentPath(_ p: String) -> String {
