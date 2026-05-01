@@ -198,7 +198,7 @@ final class SFTPSession: ObservableObject {
         }
 
         let escaped = shellEscape(path)
-        let cmd = "cd \(escaped) && pwd && ls -la --time-style='+%Y-%m-%d %H:%M:%S'"
+        let cmd = "cd \(escaped) && pwd && (ls -la --time-style='+%Y-%m-%d %H:%M:%S' 2>/dev/null || ls -la)"
         var args = sshBaseArgs(usePassword: connectedPassword != nil)
         args += [host.alias, cmd]
 
@@ -225,6 +225,8 @@ final class SFTPSession: ObservableObject {
 
         currentPath = pwd.isEmpty ? path : pwd
         entries = newEntries.sorted {
+            if $0.name == ".." { return true }
+            if $1.name == ".." { return false }
             if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
             return $0.name.lowercased() < $1.name.lowercased()
         }
@@ -448,26 +450,36 @@ final class SFTPSession: ObservableObject {
         guard let type = mode.first else { return nil }
         let isDir = type == "d", isLink = type == "l"
         guard type == "-" || isDir || isLink else { return nil }
-        guard mode.dropFirst().allSatisfy({ "rwxstST-".contains($0) }) else { return nil }
+        guard mode.dropFirst().allSatisfy({ "rwxstST-@+".contains($0) }) else { return nil }
 
         let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard parts.count >= 8 else { return nil }
 
         let size = UInt64(parts[4]) ?? 0
 
-        let df = DateFormatter()
-        df.locale = Locale(identifier: "en_US_POSIX")
-        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let modDate = df.date(from: "\(parts[5]) \(parts[6])")
+        var modDate: Date? = nil
+        var nameRaw: String
+        
+        let p5 = parts[5]
+        if p5.contains("-") && p5.count == 10 {
+            // --time-style format: 2024-01-15 10:30:00
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            modDate = df.date(from: "\(parts[5]) \(parts[6])")
+            nameRaw = parts[7...].joined(separator: " ")
+        } else {
+            // standard posix ls: Jan 15 10:30 or Jan 15 2024
+            nameRaw = parts.count > 8 ? parts[8...].joined(separator: " ") : ""
+        }
 
-        let nameRaw = parts[7...].joined(separator: " ")
         let name: String
         if isLink, let arrow = nameRaw.range(of: " -> ") {
             name = String(nameRaw[..<arrow.lowerBound])
         } else {
             name = nameRaw
         }
-        guard name != "." else { return nil }
+        guard name != "." && !name.isEmpty else { return nil }
 
         return SFTPEntry(name: name, isDirectory: isDir, isSymlink: isLink,
                          size: size, modificationTime: modDate)

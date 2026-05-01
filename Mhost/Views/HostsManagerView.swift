@@ -18,13 +18,35 @@ struct HostsManagerView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            undoRedoBar
-            searchBar
-            Divider()
-            entryList
-            errorBar
+        NavigationStack {
+            VStack(spacing: 0) {
+                undoRedoBar
+                Divider()
+                entryList
+                errorBar
+            }
+            .navigationTitle("Hosts Entries")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: { showAddSheet = true }) {
+                        Label("Add Entry", systemImage: "plus")
+                    }
+                }
+                ToolbarItem(placement: .secondaryAction) {
+                    Button(action: { manager.loadEntries() }) {
+                        Label("Reload", systemImage: "arrow.clockwise")
+                    }
+                }
+                ToolbarItem(placement: .secondaryAction) {
+                    Button(action: {
+                        showSuccessBanner = false
+                        manager.refreshDNSCache()
+                    }) {
+                        Label("Refresh DNS Cache", systemImage: "arrow.clockwise.circle")
+                    }
+                }
+            }
+            .searchable(text: $searchText, prompt: "Search hosts...")
         }
         .onAppear { manager.loadEntries() }
         .onChange(of: manager.successMessage) { _, newValue in
@@ -77,48 +99,6 @@ struct HostsManagerView: View {
                 }
             }, alignment: .top
         )
-    }
-
-    private var toolbar: some View {
-        HStack {
-            Text("Hosts Entries")
-                .font(.headline)
-            Spacer()
-            Button(action: { manager.loadEntries() }) {
-                Label("Reload", systemImage: "arrow.clockwise")
-            }
-            Button(action: {
-                showSuccessBanner = false
-                manager.refreshDNSCache()
-            }) {
-                Label("Refresh DNS Cache", systemImage: "arrow.clockwise.circle")
-            }
-            Button(action: { showAddSheet = true }) {
-                Label("Add Entry", systemImage: "plus")
-            }
-        }
-        .padding()
-    }
-
-    private var searchBar: some View {
-        HStack {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Search hosts...", text: $searchText)
-                .textFieldStyle(.plain)
-            if !searchText.isEmpty {
-                Button(action: { searchText = "" }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(8)
-        .background(.quaternary)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .padding(.horizontal)
-        .padding(.bottom, 8)
     }
 
     private var undoRedoBar: some View {

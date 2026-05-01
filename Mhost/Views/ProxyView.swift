@@ -30,8 +30,8 @@ struct ProxyView: View {
                     .tag(item)
             }
             .listStyle(.sidebar)
-            .frame(minWidth: 180)
-        } content: {
+            .navigationTitle("Proxy")
+        } detail: {
             VStack(spacing: 0) {
                 Group {
                     switch selectedSidebar {
@@ -51,7 +51,7 @@ struct ProxyView: View {
                     case .settings:
                         SettingsSection(mkcert: $mkcert)
                     case .none:
-                        EmptyView()
+                        ContentUnavailableView("Select an item in the sidebar", systemImage: "arrow.triangle.swap")
                     }
                 }
                 Spacer(minLength: 0)
@@ -88,8 +88,6 @@ struct ProxyView: View {
                 portText = String(server.settings.port)
                 refreshInterfaces()
             }
-        } detail: {
-            EmptyView()
         }
     }
 

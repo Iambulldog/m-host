@@ -1,10 +1,10 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SSHView: View {
     @State private var manager = SSHConfigManager()
     @State private var selection: UUID?
-    @State private var showColumnView: Bool = false
     @State private var editingHost: SSHHost? = nil
 
     // SessionTab: เก็บ session ที่เปิดในแท็บ
@@ -35,22 +35,46 @@ struct SSHView: View {
     @State private var searchText: String = ""
 
     var body: some View {
-        GeometryReader { geometry in
-            SSHViewLayout(
-                geometry: geometry,
-                editingHost: $editingHost,
-                manager: manager,
-                selection: $selection,
-                showColumnView: $showColumnView,
-                sessions: $sessions,
-                selectedTerminalKey: $selectedTerminalKey,
-                selectedSFTPKey: $selectedSFTPKey,
-                sftpFraction: $sftpFraction,
-                sftpSessions: $sftpSessions,
-                terminalPasswordCache: $terminalPasswordCache,
-                terminalPasswordLoadedAccounts: $terminalPasswordLoadedAccounts,
-                searchText: $searchText
-            )
+        NavigationStack {
+            GeometryReader { geometry in
+                SSHViewLayout(
+                    geometry: geometry,
+                    editingHost: $editingHost,
+                    manager: manager,
+                    selection: $selection,
+                    sessions: $sessions,
+                    selectedTerminalKey: $selectedTerminalKey,
+                    selectedSFTPKey: $selectedSFTPKey,
+                    sftpFraction: $sftpFraction,
+                    sftpSessions: $sftpSessions,
+                    terminalPasswordCache: $terminalPasswordCache,
+                    terminalPasswordLoadedAccounts: $terminalPasswordLoadedAccounts,
+                    searchText: $searchText
+                )
+            }
+            .navigationTitle("SSH Manager")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: {
+                        let newHost = SSHHost(
+                            id: UUID(),
+                            alias: "New Host",
+                            hostName: "",
+                            user: "",
+                            port: "22",
+                            identityFile: "",
+                            defaultPath: "",
+                            extraOptions: []
+                        )
+                        manager.hosts.append(newHost)
+                        manager.save()
+                        selection = newHost.id
+                        editingHost = newHost
+                    }) {
+                        Label("Add Host", systemImage: "plus")
+                    }
+                }
+            }
         }
     }
 }
@@ -60,7 +84,6 @@ private struct SSHViewLayout: View {
     @Binding var editingHost: SSHHost?
     var manager: SSHConfigManager
     @Binding var selection: UUID?
-    @Binding var showColumnView: Bool
     @Binding var sessions: [SSHView.SessionTab]
     @Binding var selectedTerminalKey: String?
     @Binding var selectedSFTPKey: String?
@@ -68,6 +91,7 @@ private struct SSHViewLayout: View {
 
     /// keyboard highlight index ใน filtered list (แยกจาก selection ที่ใช้กับ editor)
     @State private var highlightedIndex: Int? = nil
+    @State private var draggedHostID: UUID? = nil
     @FocusState private var listFocused: Bool
     @Binding var sftpSessions: [String: SFTPSession]
     @Binding var terminalPasswordCache: [String: String]
@@ -86,9 +110,13 @@ private struct SSHViewLayout: View {
         }
     }
 
+    private var canReorderHosts: Bool {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var body: some View {
         let safeWidth = geometry.size.width.isFinite && !geometry.size.width.isNaN && geometry.size.width > 0 ? geometry.size.width : 1
-        let sidebarWidth = max(safeWidth * 0.22, 220)
+        let sidebarWidth = max(safeWidth * 0.25, 250)
         // editor ต้องกว้างพอให้ field กับ label แสดงครบ — บังคับขั้นต่ำ 340pt
         let rightbarWidth = max(safeWidth * 0.28, 340)
         let mainWidth = editingHost == nil
@@ -97,23 +125,17 @@ private struct SSHViewLayout: View {
         HStack(spacing: 0) {
             // Sidebar
             VStack(spacing: 0) {
-                HStack {
-                    Text("SSH Hosts")
-                        .font(.headline)
-                    Spacer()
-                    Button(action: { showColumnView.toggle() }) {
-                        Image(systemName: showColumnView ? "list.bullet" : "square.grid.2x2")
-                            .help(showColumnView ? "แสดงแบบ List" : "แสดงแบบ Column")
-                    }
-                    .buttonStyle(.plain)
-                }
+                Text("SSH Hosts")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal)
                 .padding(.top, 8)
-                // Search bar — ↓ arrow ย้าย focus ไป list, Enter connect อันแรก
+                .padding(.bottom, 4)
+                
                 TextField("ค้นหา SSH host...", text: $searchText)
                     .textFieldStyle(.roundedBorder)
                     .padding(.horizontal, 8)
-                    .padding(.top, 4)
+                    .padding(.bottom, 8)
                     .onKeyPress(.downArrow) {
                         guard !filteredHosts.isEmpty else { return .handled }
                         highlightedIndex = min((highlightedIndex ?? -1) + 1, filteredHosts.count - 1)
@@ -128,97 +150,85 @@ private struct SSHViewLayout: View {
                         return .handled
                     }
                     .onChange(of: searchText) { _, _ in highlightedIndex = nil }
-                if showColumnView {
-                    // Column/Grid view
-                    ScrollView {
-                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                            ForEach(filteredHosts) { h in
-                                SSHHostGridItemView(
-                                    host: h,
-                                    isSelected: selection == h.id,
-                                    onSelect: {
-                                        print("[DEBUG] Grid select host: \(h.alias)")
-                                        selection = h.id
-                                    },
-                                    onEdit: {
-                                        print("[DEBUG] Grid edit host: \(h.alias)")
-                                        editingHost = h
-                                    },
-                                    onOpenTerminal: { openSession(for: h, kind: .terminal) },
-                                    onOpenSFTP: { openSession(for: h, kind: .sftp) }
-                                )
-                            }
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.bottom, 8)
-                    }
-                } else {
-                    // List view — keyboard navigable
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(spacing: 0) {
-                                ForEach(Array(filteredHosts.enumerated()), id: \.element.id) { idx, h in
-                                    HStack(spacing: 6) {
-                                        VStack(alignment: .leading, spacing: 1) {
-                                            Text(h.alias).font(.system(.body, design: .monospaced))
-                                            if !h.hostName.isEmpty {
-                                                Text("\(h.user.isEmpty ? "" : h.user + "@")\(h.hostName)")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        Spacer()
-                                        Button { openSession(for: h, kind: .terminal) } label: {
-                                            Image(systemName: "terminal").foregroundStyle(Color.accentColor)
-                                        }
-                                        .buttonStyle(.plain).help("เชื่อมต่อ Terminal")
-                                        Button { openSession(for: h, kind: .sftp) } label: {
-                                            Image(systemName: "folder").foregroundStyle(Color.accentColor)
-                                        }
-                                        .buttonStyle(.plain).help("เชื่อมต่อ SFTP")
-                                    }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 7)
-                                    .background(
-                                        highlightedIndex == idx
-                                            ? Color.accentColor.opacity(0.20)
-                                            : (selection == h.id ? Color.accentColor.opacity(0.09) : Color.clear)
-                                    )
+                // List view — keyboard navigable
+                ScrollViewReader { proxy in
+                    List {
+                        ForEach(Array(filteredHosts.enumerated()), id: \.element.id) { idx, h in
+                            HStack(spacing: 6) {
+                                Image(systemName: "line.3.horizontal")
+                                    .foregroundStyle(canReorderHosts ? .secondary : .tertiary)
+                                    .help(canReorderHosts ? "ลากเพื่อเรียงลำดับ" : "ล้างคำค้นหาก่อนเรียงลำดับ")
+                                    .padding(.horizontal, 2)
                                     .contentShape(Rectangle())
-                                    .id(h.id)
-                                    .onTapGesture {
-                                        selection = h.id
-                                        editingHost = h
-                                        highlightedIndex = idx
+                                    .onDrag { dragProvider(for: h) }
+
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(h.alias).font(.system(.body, design: .monospaced))
+                                    if !h.hostName.isEmpty {
+                                        Text("\(h.user.isEmpty ? "" : h.user + "@")\(h.hostName)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
                                     }
-                                    Divider().padding(.leading, 10)
                                 }
+                                Spacer()
+
+                                Button { openSession(for: h, kind: .terminal) } label: {
+                                    Image(systemName: "terminal").foregroundStyle(Color.accentColor)
+                                }
+                                .buttonStyle(.plain).help("เชื่อมต่อ Terminal")
+                                Button { openSession(for: h, kind: .sftp) } label: {
+                                    Image(systemName: "folder").foregroundStyle(Color.accentColor)
+                                }
+                                .buttonStyle(.plain).help("เชื่อมต่อ SFTP")
                             }
-                        }
-                        .focusable()
-                        .focused($listFocused)
-                        .onKeyPress(.upArrow) {
-                            guard !filteredHosts.isEmpty else { return .handled }
-                            let next = max(0, (highlightedIndex ?? 1) - 1)
-                            highlightedIndex = next
-                            proxy.scrollTo(filteredHosts[next].id, anchor: .center)
-                            return .handled
-                        }
-                        .onKeyPress(.downArrow) {
-                            guard !filteredHosts.isEmpty else { return .handled }
-                            let next = min(filteredHosts.count - 1, (highlightedIndex ?? -1) + 1)
-                            highlightedIndex = next
-                            proxy.scrollTo(filteredHosts[next].id, anchor: .center)
-                            return .handled
-                        }
-                        .onKeyPress(.return) {
-                            guard let idx = highlightedIndex, idx < filteredHosts.count else { return .ignored }
-                            openSession(for: filteredHosts[idx], kind: .terminal)
-                            return .handled
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                            .id(h.id)
+                            .onTapGesture {
+                                selection = h.id
+                                editingHost = h
+                                highlightedIndex = idx
+                            }
+                            .listRowBackground(
+                                highlightedIndex == idx
+                                    ? Color.accentColor.opacity(0.20)
+                                    : (selection == h.id ? Color.accentColor.opacity(0.09) : Color.clear)
+                            )
+                            .onDrop(
+                                of: [UTType.text],
+                                delegate: SSHHostReorderDropDelegate(
+                                    targetHost: h,
+                                    draggedHostID: $draggedHostID,
+                                    canReorder: canReorderHosts,
+                                    move: moveDraggedHost
+                                )
+                            )
                         }
                     }
-                    .frame(minWidth: 220)
+                    .listStyle(.plain)
+                    .focusable()
+                    .focused($listFocused)
+                    .onKeyPress(.upArrow) {
+                        guard !filteredHosts.isEmpty else { return .handled }
+                        let next = max(0, (highlightedIndex ?? 1) - 1)
+                        highlightedIndex = next
+                        proxy.scrollTo(filteredHosts[next].id, anchor: .center)
+                        return .handled
+                    }
+                    .onKeyPress(.downArrow) {
+                        guard !filteredHosts.isEmpty else { return .handled }
+                        let next = min(filteredHosts.count - 1, (highlightedIndex ?? -1) + 1)
+                        highlightedIndex = next
+                        proxy.scrollTo(filteredHosts[next].id, anchor: .center)
+                        return .handled
+                    }
+                    .onKeyPress(.return) {
+                        guard let idx = highlightedIndex, idx < filteredHosts.count else { return .ignored }
+                        openSession(for: filteredHosts[idx], kind: .terminal)
+                        return .handled
+                    }
                 }
+                .frame(minWidth: 220)
             }
             .padding(.vertical, 8)
             .frame(width: sidebarWidth)
@@ -342,6 +352,28 @@ private struct SSHViewLayout: View {
         }
     }
 
+    // MARK: - Host Reordering
+
+    private func dragProvider(for host: SSHHost) -> NSItemProvider {
+        guard canReorderHosts else { return NSItemProvider() }
+        draggedHostID = host.id
+        return NSItemProvider(object: host.id.uuidString as NSString)
+    }
+
+    private func moveDraggedHost(_ draggedID: UUID, onto targetHost: SSHHost) {
+        guard canReorderHosts,
+              draggedID != targetHost.id,
+              let fromIndex = manager.hosts.firstIndex(where: { $0.id == draggedID }),
+              let targetIndex = manager.hosts.firstIndex(where: { $0.id == targetHost.id }) else { return }
+
+        let moved = manager.hosts.remove(at: fromIndex)
+        let insertionIndex = min(targetIndex, manager.hosts.count)
+        manager.hosts.insert(moved, at: insertionIndex)
+        manager.save()
+        selection = draggedID
+        highlightedIndex = insertionIndex
+    }
+
     // MARK: - Session Tab Logic
     private func openSession(for host: SSHHost, kind: SSHView.SessionTab.Kind) {
         let key = "\(host.id.uuidString)-\(kind == .terminal ? "t" : "s")"
@@ -407,6 +439,34 @@ private struct SSHViewLayout: View {
     }
 }
 // --- END SSHView ---
+
+private struct SSHHostReorderDropDelegate: DropDelegate {
+    let targetHost: SSHHost
+    @Binding var draggedHostID: UUID?
+    let canReorder: Bool
+    let move: (UUID, SSHHost) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool {
+        canReorder && draggedHostID != nil
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: canReorder ? .move : .cancel)
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard canReorder,
+              let draggedHostID,
+              draggedHostID != targetHost.id else { return }
+        move(draggedHostID, targetHost)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let didDrop = canReorder && draggedHostID != nil
+        draggedHostID = nil
+        return didDrop
+    }
+}
 
 private struct HostEditor: View {
     @Binding var host: SSHHost
@@ -619,13 +679,22 @@ private struct HostEditor: View {
 private struct SSHHostGridItemView: View {
     let host: SSHHost
     let isSelected: Bool
+    let canReorder: Bool
     let onSelect: () -> Void
     let onEdit: () -> Void
+    let onDragProvider: () -> NSItemProvider
     let onOpenTerminal: () -> Void
     let onOpenSFTP: () -> Void
 
     var body: some View {
         HStack {
+            Image(systemName: "line.3.horizontal")
+                .foregroundStyle(canReorder ? .secondary : .tertiary)
+                .help(canReorder ? "ลากเพื่อเรียงลำดับ" : "ล้างคำค้นหาก่อนเรียงลำดับ")
+                .padding(.horizontal, 2)
+                .contentShape(Rectangle())
+                .onDrag(onDragProvider)
+
             VStack(alignment: .leading) {
                 Text(host.alias).font(.system(.body, design: .monospaced))
                 if !host.hostName.isEmpty {
