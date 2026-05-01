@@ -74,6 +74,12 @@ struct SFTPBrowserView: View {
     @State private var previewTempURL: URL? = nil
     @State private var previewDirty = false
     @State private var fileMonitor: FileMonitor? = nil
+    @State private var editEntry: SFTPEntry? = nil
+    @State private var editTempURL: URL? = nil
+    @State private var editRemotePath: String? = nil
+    @State private var editUploadWorkItem: DispatchWorkItem? = nil
+    @State private var isAutoUploadingEdit = false
+    @State private var defaultEditorRefreshToken = UUID()
 
     // hover highlight
     @State private var hoveredEntryID: SFTPEntry.ID? = nil
@@ -127,20 +133,22 @@ struct SFTPBrowserView: View {
             Button { Task { await session.goUp() } } label: {
                 Image(systemName: "arrow.up")
             }
-            .help("ขึ้นโฟลเดอร์ระดับบน").disabled(!session.isConnected)
+            .help("ขึ้นโฟลเดอร์ระดับบน").disabled(!session.isConnected || session.isLoadingDirectory)
 
             Button { Task { await session.loadDirectory(session.currentPath) } } label: {
                 Image(systemName: "arrow.clockwise")
             }
-            .help("Reload").disabled(!session.isConnected)
+            .help("Reload").disabled(!session.isConnected || session.isLoadingDirectory)
 
             TextField("path", text: $pathInput)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(.caption, design: .monospaced))
                 .onSubmit {
+                    guard !session.isLoadingDirectory else { return }
                     let p = pathInput.trimmingCharacters(in: .whitespaces)
                     if !p.isEmpty { Task { await session.loadDirectory(p) } }
                 }
+                .disabled(session.isLoadingDirectory)
 
             if session.isConnected {
                 Button(role: .destructive) { Task { await session.disconnect() } } label: {
@@ -187,11 +195,20 @@ struct SFTPBrowserView: View {
 
     private var fileArea: some View {
         VStack(spacing: 0) {
-            if session.entries.isEmpty, let e = session.lastError, !e.isEmpty {
-                emptyErrorView(e)
-            } else {
-                fileTable
+            ZStack {
+                if session.entries.isEmpty, let e = session.lastError, !e.isEmpty {
+                    emptyErrorView(e)
+                } else {
+                    fileTable
+                }
+
+                if session.isLoadingDirectory {
+                    folderLoadingOverlay
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                        .zIndex(1)
+                }
             }
+            .animation(.easeInOut(duration: 0.18), value: session.isLoadingDirectory)
 
             // preview dirty banner
             if previewDirty, let entry = previewEntry {
@@ -256,9 +273,17 @@ struct SFTPBrowserView: View {
                             .frame(width: colDate, alignment: .trailing)
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { Task { await session.enter(e) } }
+                    .onTapGesture(count: 2) {
+                        guard !session.isLoadingDirectory else { return }
+                        if e.isDirectory {
+                            Task { await session.enter(e) }
+                        } else {
+                            openForEditing(e)
+                        }
+                    }
                     .contextMenu { rowMenu(e) }
                     .onDrag { dragProvider(for: e) }
+                    .disabled(session.isLoadingDirectory)
                     .onHover { hoveredEntryID = $0 ? e.id : nil }
                     .listRowBackground(
                         hoveredEntryID == e.id
@@ -270,6 +295,7 @@ struct SFTPBrowserView: View {
             }
             .listStyle(.plain)
             .onDrop(of: [UTType.fileURL], isTargeted: $isDroppingOver) { providers in
+                guard !session.isLoadingDirectory else { return false }
                 dropFiles(providers)
                 return true
             }
@@ -281,11 +307,48 @@ struct SFTPBrowserView: View {
         }
     }
 
+    private var folderLoadingOverlay: some View {
+        ZStack {
+            Rectangle()
+                .fill(.black.opacity(0.08))
+                .ignoresSafeArea()
+
+            VStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.large)
+                Text("กำลังโหลดโฟลเดอร์…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 16)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+            )
+            .shadow(radius: 12, y: 4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(true)
+    }
+
     // MARK: - Context menu
 
     @ViewBuilder
     private func rowMenu(_ e: SFTPEntry) -> some View {
         if !e.isDirectory {
+            Button { openForEditing(e) } label: {
+                Label("Open / Edit", systemImage: "square.and.pencil")
+            }
+            Button { chooseDefaultEditor(for: e, thenOpen: true) } label: {
+                Label("Choose Default App & Edit…", systemImage: "app.badge")
+            }
+            if let appURL = defaultEditorAppURL(for: e) {
+                Button { resetDefaultEditor(for: e) } label: {
+                    Label("Reset Default App (\(appURL.deletingPathExtension().lastPathComponent))", systemImage: "arrow.uturn.backward")
+                }
+            }
             Button { openPreview(e, useQL: true) } label: {
                 Label("Quick Look", systemImage: "eye")
             }
@@ -387,6 +450,144 @@ struct SFTPBrowserView: View {
         isUploading = false
     }
 
+    // MARK: - Open / Edit
+
+    private func openForEditing(_ entry: SFTPEntry, appURL: URL? = nil) {
+        guard !entry.isDirectory else {
+            Task { await session.enter(entry) }
+            return
+        }
+
+        editUploadWorkItem?.cancel()
+        fileMonitor?.stop()
+        previewDirty = false
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mhost-edit-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let dst = tmp.appendingPathComponent(entry.name)
+        let remotePath = session.remotePath(of: entry)
+        let editorAppURL = appURL ?? defaultEditorAppURL(for: entry)
+
+        downloadStatus = "กำลังเปิด \(entry.name) เพื่อแก้ไข…"
+        isDownloading = true
+
+        Task {
+            switch await session.download(entry, to: dst) {
+            case .success:
+                downloadStatus = "✓ เปิด \(entry.name) แล้ว — เมื่อกด Save จะ sync กลับอัตโนมัติ"
+                isDownloading = false
+                editEntry = entry
+                editTempURL = dst
+                editRemotePath = remotePath
+                previewEntry = nil
+                previewTempURL = nil
+                startMonitor(dst) {
+                    scheduleEditedFileUpload()
+                }
+                openLocalFile(dst, with: editorAppURL)
+            case .failure(let err):
+                downloadStatus = "✗ เปิดไฟล์ไม่ได้: \(err.localizedDescription)"
+                isDownloading = false
+            }
+        }
+    }
+
+    private func scheduleEditedFileUpload() {
+        guard let editTempURL, let editRemotePath else { return }
+
+        editUploadWorkItem?.cancel()
+        uploadStatus = "ตรวจพบการแก้ไข — กำลังรอให้ editor save เสร็จ…"
+
+        let fileName = editEntry?.name ?? editTempURL.lastPathComponent
+        let workItem = DispatchWorkItem {
+            Task { @MainActor in
+                await uploadEditedFile(localURL: editTempURL, remotePath: editRemotePath, fileName: fileName)
+            }
+        }
+        editUploadWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
+    private func uploadEditedFile(localURL: URL, remotePath: String, fileName: String) async {
+        guard !isAutoUploadingEdit else {
+            scheduleEditedFileUpload()
+            return
+        }
+
+        isAutoUploadingEdit = true
+        isUploading = true
+        uploadStatus = "กำลัง sync \(fileName) กลับ server…"
+
+        switch await session.upload(localURL: localURL, to: remotePath) {
+        case .success:
+            uploadStatus = "✓ sync \(fileName) สำเร็จ"
+            await session.loadDirectory(session.currentPath)
+        case .failure(let err):
+            uploadStatus = "✗ sync \(fileName) ไม่สำเร็จ: \(err.localizedDescription)"
+        }
+
+        isUploading = false
+        isAutoUploadingEdit = false
+    }
+
+    private func chooseDefaultEditor(for entry: SFTPEntry, thenOpen: Bool) {
+        let panel = NSOpenPanel()
+        panel.title = "เลือก Default App สำหรับ .\(displayExtension(for: entry))"
+        panel.message = "Mhost จะใช้แอปนี้เปิดไฟล์ .\(displayExtension(for: entry)) ใน SFTP edit (ไม่เปลี่ยน default ของ macOS ทั้งระบบ)"
+        panel.prompt = "Use This App"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [UTType.applicationBundle]
+
+        guard panel.runModal() == .OK, let appURL = panel.url else { return }
+        saveDefaultEditor(appURL, for: entry)
+        if thenOpen {
+            openForEditing(entry, appURL: appURL)
+        }
+    }
+
+    private func openLocalFile(_ url: URL, with appURL: URL?) {
+        guard let appURL, FileManager.default.fileExists(atPath: appURL.path) else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        let cfg = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: cfg)
+    }
+
+    private func defaultEditorAppURL(for entry: SFTPEntry) -> URL? {
+        guard let path = UserDefaults.standard.string(forKey: defaultEditorStorageKey(for: entry)),
+              FileManager.default.fileExists(atPath: path) else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    private func saveDefaultEditor(_ appURL: URL, for entry: SFTPEntry) {
+        UserDefaults.standard.set(appURL.path, forKey: defaultEditorStorageKey(for: entry))
+        defaultEditorRefreshToken = UUID()
+    }
+
+    private func resetDefaultEditor(for entry: SFTPEntry) {
+        UserDefaults.standard.removeObject(forKey: defaultEditorStorageKey(for: entry))
+        defaultEditorRefreshToken = UUID()
+    }
+
+    private func defaultEditorStorageKey(for entry: SFTPEntry) -> String {
+        "Mhost.SFTP.defaultEditor.\(normalizedExtension(for: entry))"
+    }
+
+    private func normalizedExtension(for entry: SFTPEntry) -> String {
+        let ext = (entry.name as NSString).pathExtension.lowercased()
+        return ext.isEmpty ? "__no_extension__" : ext
+    }
+
+    private func displayExtension(for entry: SFTPEntry) -> String {
+        let ext = normalizedExtension(for: entry)
+        return ext == "__no_extension__" ? "no extension" : ext
+    }
+
     // MARK: - Preview
 
     private func openPreview(_ entry: SFTPEntry, useQL: Bool) {
@@ -408,7 +609,9 @@ struct SFTPBrowserView: View {
                 isDownloading = false
                 previewEntry = entry
                 previewTempURL = dst
-                startMonitor(dst)
+                startMonitor(dst) {
+                    previewDirty = true
+                }
                 if useQL {
                     QLController.shared.show(url: dst)
                 } else {
@@ -440,10 +643,10 @@ struct SFTPBrowserView: View {
         }
     }
 
-    private func startMonitor(_ url: URL) {
+    private func startMonitor(_ url: URL, onChange: @escaping () -> Void) {
         let monitor = FileMonitor(url: url) {
             Task { @MainActor in
-                self.previewDirty = true
+                onChange()
             }
         }
         monitor.start()
@@ -466,7 +669,9 @@ struct SFTPBrowserView: View {
                     previewDirty = false
                     fileMonitor?.stop()
                     await uploadFile(localURL: localURL, to: remotePath)
-                    startMonitor(localURL) // resume watching
+                    startMonitor(localURL) {
+                        previewDirty = true
+                    } // resume watching
                 }
             }
             .buttonStyle(.borderedProminent)

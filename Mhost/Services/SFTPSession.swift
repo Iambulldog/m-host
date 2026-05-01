@@ -117,6 +117,7 @@ final class SFTPSession: ObservableObject {
     @Published var currentPath: String
     @Published var needs: Credential = .none
     @Published var lastError: String?
+    @Published var isLoadingDirectory: Bool = false
 
     var needsPassword: Bool { needs == .userPassword }
     var isConnected: Bool { if case .connected = status { return true }; return false }
@@ -125,6 +126,7 @@ final class SFTPSession: ObservableObject {
 
     /// password ที่ใช้ connect สำเร็จ (nil = key/agent auth)
     private var connectedPassword: String? = nil
+    private var directoryLoadGeneration = 0
 
     init(host: SSHHost) {
         self.host = host
@@ -171,6 +173,8 @@ final class SFTPSession: ObservableObject {
     }
 
     func disconnect() async {
+        directoryLoadGeneration += 1
+        isLoadingDirectory = false
         connectedPassword = nil
         status = .idle
         entries = []
@@ -182,6 +186,16 @@ final class SFTPSession: ObservableObject {
     /// ssh alias "cd path && pwd && ls -la --time-style='+%Y-%m-%d %H:%M:%S'"
     func loadDirectory(_ path: String) async {
         guard isConnected else { return }
+        guard !isLoadingDirectory else { return }
+
+        isLoadingDirectory = true
+        directoryLoadGeneration += 1
+        let generation = directoryLoadGeneration
+        defer {
+            if directoryLoadGeneration == generation {
+                isLoadingDirectory = false
+            }
+        }
 
         let escaped = shellEscape(path)
         let cmd = "cd \(escaped) && pwd && ls -la --time-style='+%Y-%m-%d %H:%M:%S'"
@@ -189,6 +203,7 @@ final class SFTPSession: ObservableObject {
         args += [host.alias, cmd]
 
         let r = await runSSH(args: args, password: connectedPassword, timeout: 30)
+        guard directoryLoadGeneration == generation, isConnected else { return }
 
         if r.exit != 0 {
             lastError = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
